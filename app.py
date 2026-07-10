@@ -3,6 +3,7 @@ import gradio as gr
 import requests
 import inspect
 import pandas as pd
+import spaces
 
 # (Keep Constants as is)
 # --- Constants ---
