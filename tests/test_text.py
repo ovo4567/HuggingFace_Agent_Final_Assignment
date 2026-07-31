@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import zipfile
 
+import pandas as pd
 import pytest
 import requests
 from PIL import Image
@@ -389,3 +390,366 @@ class TestExtractFramesFromVideo:
         for p in frames:
             assert os.path.exists(p)
             Image.open(p).verify()  # each frame is a valid image file
+
+
+# ─── Worklog serialization (ticket 03) ──────────────────────────────────
+class _FakeTiming:
+    """Minimal stand-in for smolagents.monitoring.Timing."""
+
+    def __init__(self, duration):
+        self._duration = duration
+
+    @property
+    def duration(self):
+        return self._duration
+
+
+class _FakeToolCall:
+    """Minimal stand-in for smolagents.memory.ToolCall."""
+
+    def __init__(self, name, arguments=None):
+        self.name = name
+        self.arguments = arguments
+
+
+class _FakeActionStep:
+    """Minimal stand-in for smolagents.memory.ActionStep (duck-typed)."""
+
+    def __init__(self, step_number, thought=None, tool_calls=None, observations=None,
+                 code_action=None, duration=None, error=None,
+                 is_final_answer=False, action_output=None):
+        self.step_number = step_number
+        self.model_output = thought
+        self.tool_calls = tool_calls
+        self.observations = observations
+        self.code_action = code_action
+        self.timing = _FakeTiming(duration) if duration is not None else None
+        self.error = error
+        self.is_final_answer = is_final_answer
+        self.action_output = action_output
+
+
+class _FakeTaskStep:
+    """Minimal stand-in for smolagents.memory.TaskStep (no step_number)."""
+
+    def __init__(self, task):
+        self.task = task
+
+
+class TestSerializeWorklog:
+    def test_full_trace_fields_per_step(self):
+        steps = [
+            _FakeTaskStep(task="Q?"),
+            _FakeActionStep(
+                step_number=1,
+                thought="I should read the PDF.",
+                tool_calls=[_FakeToolCall("inspect_pdf", {"pdf_path": "a.pdf"})],
+                observations="Page 1 contents...",
+                code_action="",
+                duration=2.5,
+            ),
+        ]
+        worklog = text._serialize_worklog(steps, status="completed")
+        assert worklog["status"] == "completed"
+        assert worklog["total_duration_sec"] == 2.5
+        assert len(worklog["steps"]) == 1
+        step = worklog["steps"][0]
+        assert step["step_number"] == 1
+        assert step["type"] == "action"
+        assert step["thought"] == "I should read the PDF."
+        assert step["observations"] == "Page 1 contents..."
+        assert step["code_action"] == ""
+        assert step["duration_sec"] == 2.5
+        assert step["tool_calls"] == [{"name": "inspect_pdf", "arguments": {"pdf_path": "a.pdf"}}]
+
+    def test_final_answer_step_is_marked(self):
+        steps = [_FakeActionStep(step_number=1, is_final_answer=True, action_output="42")]
+        worklog = text._serialize_worklog(steps)
+        assert worklog["steps"][0]["type"] == "final"
+        assert worklog["steps"][0]["action_output"] == "42"
+
+    def test_tool_summary_counts_and_timing(self):
+        steps = [
+            _FakeActionStep(1, tool_calls=[_FakeToolCall("inspect_pdf")], duration=10.0),
+            _FakeActionStep(
+                2,
+                tool_calls=[_FakeToolCall("inspect_pdf"), _FakeToolCall("transcribe_audio")],
+                duration=4.0,
+            ),
+        ]
+        summary = text._serialize_tool_summary(steps)
+        by_name = {s["name"]: s for s in summary}
+        assert set(by_name) == {"inspect_pdf", "transcribe_audio"}
+        assert by_name["inspect_pdf"]["calls"] == 2
+        assert by_name["inspect_pdf"]["total_sec"] == 12.0  # 10 + half of 4
+        assert by_name["inspect_pdf"]["avg_sec"] == 6.0
+        assert by_name["transcribe_audio"]["calls"] == 1
+        assert by_name["transcribe_audio"]["total_sec"] == 2.0
+        assert by_name["transcribe_audio"]["avg_sec"] == 2.0
+
+    def test_skips_task_steps(self):
+        steps = [
+            _FakeTaskStep(task="Q?"),
+            _FakeActionStep(1, thought="x", duration=1.0),
+        ]
+        worklog = text._serialize_worklog(steps)
+        assert len(worklog["steps"]) == 1
+        assert worklog["steps"][0]["thought"] == "x"
+
+    def test_error_field_included(self):
+        steps = [_FakeActionStep(1, error=RuntimeError("boom"))]
+        worklog = text._serialize_worklog(steps)
+        assert worklog["steps"][0]["error"] == "boom"
+
+    def test_missing_attributes_are_safe(self):
+        steps = [_FakeActionStep(1, thought=None, tool_calls=None, observations=None)]
+        worklog = text._serialize_worklog(steps)
+        step = worklog["steps"][0]
+        assert step["thought"] == ""
+        assert step["observations"] == ""
+        assert step["tool_calls"] == []
+        assert step["duration_sec"] == 0.0
+
+    def test_observations_list_is_joined(self):
+        steps = [_FakeActionStep(1, observations=["a", "b"])]
+        worklog = text._serialize_worklog(steps)
+        assert worklog["steps"][0]["observations"] == "a\nb"
+
+    def test_string_tool_arguments_are_parsed_as_json(self):
+        steps = [_FakeActionStep(1, tool_calls=[_FakeToolCall("search", '{"q": "x"}')])]
+        worklog = text._serialize_worklog(steps)
+        assert worklog["steps"][0]["tool_calls"][0]["arguments"] == {"q": "x"}
+
+    def test_total_duration_sums_steps(self):
+        steps = [
+            _FakeActionStep(1, duration=1.5),
+            _FakeActionStep(2, duration=2.5),
+        ]
+        worklog = text._serialize_worklog(steps)
+        assert worklog["total_duration_sec"] == 4.0
+
+
+# ─── Answer bundle I/O (ticket 03) ──────────────────────────────────────
+class TestAnswerBundle:
+    def test_make_bundle_entry_shape(self):
+        entry = text._make_bundle_entry(
+            task_id="t1", question="Q?", level="1", file_name="a.pdf",
+            answer="42", worklog={"status": "completed", "steps": []},
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        assert entry["task_id"] == "t1"
+        assert entry["question"] == "Q?"
+        assert entry["level"] == "1"
+        assert entry["file_name"] == "a.pdf"
+        assert entry["answer"] == "42"
+        assert entry["worklog"] == {"status": "completed", "steps": []}
+        assert entry["timestamp"] == "2026-01-01T00:00:00Z"
+
+    def test_load_missing_bundle_returns_empty(self, tmp_path):
+        assert text._load_answer_bundle(str(tmp_path / "missing.json")) == {}
+
+    def test_load_corrupt_bundle_returns_empty(self, tmp_path):
+        path = tmp_path / "bundle.json"
+        path.write_text("{not valid json")
+        assert text._load_answer_bundle(str(path)) == {}
+
+    def test_save_then_load_round_trip(self, tmp_path):
+        path = str(tmp_path / "bundle.json")
+        bundle = {"t1": text._make_bundle_entry(
+            "t1", "Q?", "1", "", "42", {"steps": []}, "2026-01-01T00:00:00Z")}
+        saved = text._save_answer_bundle(bundle, path)
+        assert saved == path
+        assert text._load_answer_bundle(path) == bundle
+
+    def test_save_leaves_no_temp_file(self, tmp_path):
+        path = str(tmp_path / "bundle.json")
+        text._save_answer_bundle({}, path)
+        assert os.path.exists(path)
+        assert not os.path.exists(path + ".tmp")
+
+
+# ─── Run pipeline bundling (ticket 03) ──────────────────────────────────
+class _FakeSolverAgent:
+    calls = []
+
+    def __init__(self):
+        pass
+
+    def solve(self, task_id, question, file_name):
+        _FakeSolverAgent.calls.append(task_id)
+        worklog = {
+            "steps": [{"step_number": 1, "type": "action", "thought": "t",
+                       "tool_calls": [], "observations": "o", "code_action": "",
+                       "duration_sec": 0.0}],
+            "tool_summary": [],
+            "total_duration_sec": 0.0,
+            "status": "completed",
+        }
+        return f"answer-{task_id}", worklog
+
+
+class _FlakySolverAgent:
+    calls = []
+
+    def __init__(self):
+        pass
+
+    def solve(self, task_id, question, file_name):
+        _FlakySolverAgent.calls.append(task_id)
+        if task_id == "t1":
+            return "Error: boom", {
+                "steps": [], "tool_summary": [],
+                "total_duration_sec": 0.0, "status": "error",
+            }
+        worklog = {
+            "steps": [], "tool_summary": [],
+            "total_duration_sec": 0.0, "status": "completed",
+        }
+        return f"answer-{task_id}", worklog
+
+
+class TestRunPipelineBundling:
+    FAKE_QUESTIONS = [
+        {"task_id": "t1", "question": "Q1?", "Level": "1", "file_name": ""},
+        {"task_id": "t2", "question": "Q2?", "Level": "2", "file_name": ""},
+    ]
+
+    def _patch(self, monkeypatch, tmp_path, agent_cls, questions=None):
+        questions = self.FAKE_QUESTIONS if questions is None else questions
+        monkeypatch.setattr(text, "_call_with_retry",
+                            lambda fn, **kw: questions)
+        monkeypatch.setattr(text, "ANSWER_BUNDLE_PATH",
+                            str(tmp_path / "bundle.json"))
+        monkeypatch.setattr(text, "RESULTS_CSV_PATH",
+                            str(tmp_path / "results.csv"))
+        monkeypatch.setattr(text, "GAIASolverAgent", agent_cls)
+
+    def test_first_run_solves_and_writes_bundle(self, monkeypatch, tmp_path):
+        _FakeSolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _FakeSolverAgent)
+        text.run_pipeline_and_save_csv(force=False)
+
+        assert set(_FakeSolverAgent.calls) == {"t1", "t2"}
+        bundle = text._load_answer_bundle(str(tmp_path / "bundle.json"))
+        assert set(bundle) == {"t1", "t2"}
+        assert bundle["t1"]["answer"] == "answer-t1"
+        assert bundle["t1"]["worklog"]["status"] == "completed"
+
+        df = pd.read_csv(tmp_path / "results.csv")
+        assert set(df["task_id"]) == {"t1", "t2"}
+        assert set(df["source"]) == {"live"}
+        assert set(df["status"]) == {"completed"}
+
+    def test_rerun_submits_from_bundle_without_solving(self, monkeypatch, tmp_path):
+        _FakeSolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _FakeSolverAgent)
+        text.run_pipeline_and_save_csv(force=False)
+        _FakeSolverAgent.calls = []  # reset
+
+        text.run_pipeline_and_save_csv(force=False)
+
+        assert _FakeSolverAgent.calls == []
+        bundle = text._load_answer_bundle(str(tmp_path / "bundle.json"))
+        assert set(bundle) == {"t1", "t2"}
+        df = pd.read_csv(tmp_path / "results.csv")
+        assert set(df["source"]) == {"bundle"}
+        assert df.loc[df["task_id"] == "t1", "answer"].iloc[0] == "answer-t1"
+
+    def test_force_reresolves_everything(self, monkeypatch, tmp_path):
+        _FakeSolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _FakeSolverAgent)
+        text.run_pipeline_and_save_csv(force=False)
+        _FakeSolverAgent.calls = []
+
+        text.run_pipeline_and_save_csv(force=True)
+
+        assert set(_FakeSolverAgent.calls) == {"t1", "t2"}
+        df = pd.read_csv(tmp_path / "results.csv")
+        assert set(df["source"]) == {"live"}
+
+    def test_failed_task_is_not_bundled_and_is_retried(self, monkeypatch, tmp_path):
+        _FlakySolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _FlakySolverAgent)
+        text.run_pipeline_and_save_csv(force=False)
+
+        bundle = text._load_answer_bundle(str(tmp_path / "bundle.json"))
+        assert "t1" not in bundle
+        assert "t2" in bundle
+        df = pd.read_csv(tmp_path / "results.csv")
+        assert df.loc[df["task_id"] == "t1", "status"].iloc[0] == "error"
+        assert df.loc[df["task_id"] == "t2", "status"].iloc[0] == "completed"
+
+        # The failed Task is still missing from the bundle, so the next Run
+        # solves it again; the already-solved Task is not re-solved.
+        _FlakySolverAgent.calls = []
+        text.run_pipeline_and_save_csv(force=False)
+        assert _FlakySolverAgent.calls == ["t1"]
+
+    def test_force_reresolve_removes_stale_entry_on_failure(self, monkeypatch, tmp_path):
+        # Run 1 solves both Tasks into the bundle.
+        _FakeSolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _FakeSolverAgent)
+        text.run_pipeline_and_save_csv(force=False)
+        assert set(text._load_answer_bundle(str(tmp_path / "bundle.json"))) == {"t1", "t2"}
+
+        # Run 2 force re-solves: t1 now fails, t2 succeeds. The stale t1 entry
+        # must not survive (a non-forced Run would otherwise resubmit the old
+        # Answer while this Run's CSV shows an error).
+        _FlakySolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _FlakySolverAgent)
+        text.run_pipeline_and_save_csv(force=True)
+
+        bundle = text._load_answer_bundle(str(tmp_path / "bundle.json"))
+        assert "t1" not in bundle
+        assert bundle["t2"]["answer"] == "answer-t2"
+        df = pd.read_csv(tmp_path / "results.csv")
+        assert df.loc[df["task_id"] == "t1", "status"].iloc[0] == "error"
+
+    def test_bundle_is_pruned_to_served_set(self, monkeypatch, tmp_path):
+        _FakeSolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _FakeSolverAgent)
+        text.run_pipeline_and_save_csv(force=False)  # serves {t1, t2}
+        assert set(text._load_answer_bundle(str(tmp_path / "bundle.json"))) == {"t1", "t2"}
+
+        # Server now serves only t1: the bundle must be pruned so it stays
+        # consistent with the results CSV and the served Question set.
+        _FakeSolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _FakeSolverAgent,
+                    questions=self.FAKE_QUESTIONS[:1])
+        text.run_pipeline_and_save_csv(force=False)
+
+        bundle = text._load_answer_bundle(str(tmp_path / "bundle.json"))
+        assert set(bundle) == {"t1"}
+
+
+# ─── solve() Worklog capture on failure (ticket 03) ─────────────────────
+class TestSolveWorklogOnError:
+    def test_captures_partial_trace_when_run_fails(self):
+        class _FakeMemory:
+            def __init__(self):
+                self.steps = []
+
+            def reset(self):
+                self.steps = []
+
+        class _BoomAgent:
+            def __init__(self):
+                self.memory = _FakeMemory()
+
+            def run(self, prompt):
+                self.memory.steps = [
+                    _FakeActionStep(1, thought="partial thought", duration=1.0)
+                ]
+                raise RuntimeError("model exploded")
+
+        # Build a GAIASolverAgent without __init__ (which needs DEEPSEEK_API_KEY)
+        solver = object.__new__(text.GAIASolverAgent)
+        solver.agent = _BoomAgent()
+
+        answer, worklog = solver.solve("t1", "Q?", "")
+
+        assert answer.startswith("Error:")
+        assert worklog["status"] == "error"
+        assert worklog["error"] == "model exploded"
+        assert len(worklog["steps"]) == 1
+        assert worklog["steps"][0]["thought"] == "partial thought"
