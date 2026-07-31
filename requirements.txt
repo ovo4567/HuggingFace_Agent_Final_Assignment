@@ -10,6 +10,13 @@ python-dotenv>=1.0
 # ── Web search (used by smolagents DuckDuckGoSearchTool) ───────────
 ddgs
 
+# ── Local audio & video (ticket 02) ────────────────────────────────
+# Local audio transcription (transcribe_audio) — lightweight model, WHISPER_MODEL
+faster-whisper>=1.0
+# Video frame sampling (extract_video_frames). NOTE: also requires the
+# ffmpeg/ffprobe binaries on PATH (brew install ffmpeg / apt install ffmpeg).
+yt-dlp
+
 # ── Data & document parsing ────────────────────────────────────────
 pandas>=2.2
 openpyxl>=3.1

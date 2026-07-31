@@ -25,6 +25,9 @@ import shutil
 # Import queue module for thread-safe worker pooling in parallel execution
 import queue
 
+# Import subprocess for running ffmpeg/ffprobe (video frame extraction)
+import subprocess
+
 # Import threading module for the shared vision-model lock
 import threading
 
@@ -78,6 +81,21 @@ TASK_TIMEOUT_SEC = float(os.getenv("GAIA_TASK_TIMEOUT", "600"))
 
 # Local vision model used by the 'inspect_image' tool for image attachments
 VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "Qwen/Qwen2-VL-2B-Instruct")
+
+# ─── Multimodal config (ADR-0002: local-only) ─────────────────────────
+# Local audio model used by the 'transcribe_audio' tool (faster-whisper).
+# Lightweight by default; use a larger model (e.g. 'small'/'medium') for
+# better accuracy at the cost of speed and memory.
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny")
+
+# Set USE_WHISPER_API=1 to prefer the hosted Whisper API (OpenAI or
+# OpenRouter) over the local faster-whisper model. The API path is also used
+# as a documented fallback when the local model fails and a key is configured.
+USE_WHISPER_API = os.getenv("USE_WHISPER_API", "").strip().lower() in ("1", "true", "yes", "on")
+
+# Number of evenly-spaced frames the 'extract_video_frames' tool samples from
+# a video; each frame is fed to the local vision model via 'inspect_image'.
+VIDEO_FRAMES_COUNT = int(os.getenv("VIDEO_FRAMES_COUNT", "4"))
 
 # ─── Prompt for Final Answer Cleaning ──────────────────────────────────
 # System prompt template that instructs LLM how to format outputs strictly for benchmark submission
@@ -186,6 +204,13 @@ def _get_transcript_text(transcript_data) -> str:
 
 # Define local folder path where all attachment files are stored (relative to this script)
 LOCAL_FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+
+# Folder where the 'extract_video_frames' tool writes sampled frames during a
+# Run (kept under files/ so it stays out of version control)
+VIDEO_FRAMES_DIR = os.getenv(
+    "VIDEO_FRAMES_DIR",
+    os.path.join(LOCAL_FILES_DIR, "_video_frames"),
+)
 
 def _get_local_task_file(task_id: str, file_name: str) -> str:
     """Locates a pre-downloaded file in the local files directory.
@@ -401,34 +426,75 @@ def _run_with_timeout(fn, timeout: float):
     return result_box["value"]
 
 # ─── Agent Tools ──────────────────────────────────────────────────
-@tool
-def transcribe_audio(audio_path: str) -> str: 
-    """Transcribes an audio file (MP3, WAV, M4A, etc.) using the external OpenAI/Whisper API.
 
-    Args:
-        audio_path: The local path to the audio file (e.g., 'downloads/file.mp3').
+# Shared faster-whisper model singleton (loaded once, reused across workers)
+_whisper_model = None
+_whisper_lock = threading.Lock()
+
+def _transcribe_audio_local(audio_path: str) -> str:
+    """Transcribes ``audio_path`` with the local faster-whisper model.
+
+    The model (configurable via the WHISPER_MODEL setting, default 'tiny') is
+    loaded once and reused across worker threads. Returns the transcript text,
+    or an ``"Error: ..."`` string on failure so the Agent can react without
+    crashing the Run (matching the other tools).
+    """
+    global _whisper_model
+
+    try:
+        # Import the lightweight local model only when the tool is first used
+        from faster_whisper import WhisperModel
+
+        # Load the shared model once (double-checked locking, like the vision model)
+        if _whisper_model is None:
+            with _whisper_lock:
+                if _whisper_model is None:
+                    # CPU + int8 keeps the default ('tiny') lightweight per ADR-0002
+                    _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+
+        # Beam size 1 keeps latency low for the Agent loop
+        segments, _info = _whisper_model.transcribe(audio_path, beam_size=1)
+        parts = [
+            segment.text.strip()
+            for segment in segments
+            if segment.text and segment.text.strip()
+        ]
+        transcript = " ".join(parts).strip()
+        if not transcript:
+            return f"Error: Local transcription returned no text for '{audio_path}'."
+        return transcript
+    except Exception as e:
+        return f"Error: Local transcription failed (model '{WHISPER_MODEL}'): {e}"
+
+
+def _transcribe_audio_api(audio_path: str) -> str:
+    """Transcribes ``audio_path`` with the hosted Whisper API (documented fallback).
+
+    Requires ``OPENAI_API_KEY`` (whisper-1) or ``OPENROUTER_API_KEY``
+    (openai/whisper-large-v3-turbo). Returns the transcript text, or an
+    ``"Error: ..."`` string on failure.
     """
     try:
         # Import openai library inside tool execution logic
         import openai
-        
+
         # Check for OpenAI or OpenRouter API keys (for Whisper transcription only;
         # separate from the DeepSeek agent config since DeepSeek has no audio API)
         api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-        
+
         # Select base API endpoint depending on which service key is set
         base_url = "https://api.openai.com/v1" if os.getenv("OPENAI_API_KEY") else "https://openrouter.ai/api/v1"
-        
+
         # Choose Whisper model based on API provider
         model = "whisper-1" if os.getenv("OPENAI_API_KEY") else "openai/whisper-large-v3-turbo"
-        
+
         # Return warning message if neither API key is present
         if not api_key:
-            return "Error: Transcribing audio requires configuring OPENAI_API_KEY or OPENROUTER_API_KEY."
+            return "Error: Audio transcription fallback requires configuring OPENAI_API_KEY or OPENROUTER_API_KEY."
 
         # Instantiate OpenAI client with configured API host & key
         client = openai.OpenAI(base_url=base_url, api_key=api_key)
-        
+
         # Open target audio file in binary reading mode
         with open(audio_path, "rb") as audio_file:
             # Request audio transcription from Whisper model endpoint
@@ -436,12 +502,36 @@ def transcribe_audio(audio_path: str) -> str:
                 model=model,
                 file=audio_file,
             )
-            
+
         # Return transcript text content
         return transcription.text
     except Exception as e:
         # Return error string if transcription fails
-        return f"Error transcribing audio: {e}"
+        return f"Error transcribing audio via API: {e}"
+
+@tool
+def transcribe_audio(audio_path: str) -> str:
+    """Transcribes an audio file (MP3, WAV, M4A, etc.).
+
+    Uses the lightweight local faster-whisper model (configurable via the
+    WHISPER_MODEL setting, default 'tiny'). If USE_WHISPER_API=1, or the local
+    model fails and an API key is configured, it falls back to the hosted
+    Whisper API (OpenAI or OpenRouter) as a documented fallback.
+
+    Args:
+        audio_path: The local path to the audio file (e.g., 'downloads/file.mp3').
+    """
+    if not USE_WHISPER_API:
+        # Local-first per ADR-0002; fall back to the API only when the local
+        # model fails AND a hosted key is configured
+        local = _transcribe_audio_local(audio_path)
+        if not local.startswith("Error:"):
+            return local
+        if os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
+            return _transcribe_audio_api(audio_path)
+        return local
+    # Explicit opt-in to the hosted API
+    return _transcribe_audio_api(audio_path)
 
 @tool
 def get_youtube_transcript(youtube_url: str) -> str:
@@ -474,6 +564,170 @@ def get_youtube_transcript(youtube_url: str) -> str:
     except Exception as e:
         # Return error description string if retrieval fails
         return f"Error obtaining YouTube transcript: {e}."
+
+
+def _video_frame_timestamps(duration: float, num_frames: int) -> list[float]:
+    """Computes N evenly-spaced frame timestamps within a video's duration.
+
+    Timestamps are the centers of N equal slices of ``[0, duration]``, so the
+    first and last frames are never the exact first/last instant (often a
+    frozen title card or a black frame). Clamped to ``[0, duration]``.
+
+    Args:
+        duration: The video duration in seconds.
+        num_frames: The number of evenly-spaced frames to sample (values below
+            1 are clamped to 1).
+
+    Returns:
+        A list of timestamps in seconds, in ascending order.
+    """
+    n = max(1, int(num_frames))
+    if duration <= 0:
+        return [0.0]
+    step = duration / n
+    return [round((i + 0.5) * step, 3) for i in range(n)]
+
+
+def _probe_video_duration(video_path: str) -> float:
+    """Returns the duration (seconds) of a video file via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr.strip()}")
+    return float(result.stdout.strip())
+
+
+def _resolve_frame_count(num_frames) -> int:
+    """Coerces an LLM-supplied frame count to a valid positive int.
+
+    The Agent calls the tool with whatever it inferred, so ``num_frames`` may
+    be None, a float-string ("5.5"), or a word. Anything that is not a
+    positive int falls back to the VIDEO_FRAMES_COUNT setting rather than
+    failing the whole tool call.
+    """
+    try:
+        n = int(num_frames)
+        if n > 0:
+            return n
+    except (TypeError, ValueError):
+        pass
+    return VIDEO_FRAMES_COUNT
+
+
+def _extract_frames_from_video(video_path: str, num_frames: int, job_id: str,
+                               out_dir: str | None = None) -> list[str]:
+    """Probes ``video_path`` and extracts N evenly-spaced JPEG frames.
+
+    Frames are written as ``frame_{job_id}_NN.jpg`` into ``out_dir`` (defaults
+    to the video-frames folder) and returned as absolute paths. Requires
+    ffmpeg/ffprobe on PATH. Raises on failure so the caller can clean up any
+    partial files.
+    """
+    out_dir = out_dir or VIDEO_FRAMES_DIR
+    os.makedirs(out_dir, exist_ok=True)
+
+    duration = _probe_video_duration(video_path)
+    timestamps = _video_frame_timestamps(duration, num_frames)
+
+    frame_paths = []
+    for i, ts in enumerate(timestamps, start=1):
+        frame_path = os.path.join(out_dir, f"frame_{job_id}_{i:02d}.jpg")
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", video_path,
+             "-frames:v", "1", "-q:v", "2", frame_path],
+            capture_output=True, text=True, timeout=180, check=True,
+        )
+        frame_paths.append(frame_path)
+    return frame_paths
+
+
+def _cleanup_job_artifacts(job_id: str) -> None:
+    """Removes any partial files for ``job_id`` from the video-frames folder.
+
+    Covers the downloaded video (and its ``.part``/``.ytdl`` temp files, which
+    share the ``video_{job_id}`` prefix) plus any frames already written before
+    a failure, so a failed extraction never orphans files on disk.
+    """
+    if not os.path.isdir(VIDEO_FRAMES_DIR):
+        return
+    for name in os.listdir(VIDEO_FRAMES_DIR):
+        if name.startswith(f"video_{job_id}") or name.startswith(f"frame_{job_id}"):
+            try:
+                os.remove(os.path.join(VIDEO_FRAMES_DIR, name))
+            except OSError:
+                pass
+
+
+@tool
+def extract_video_frames(video_url: str, num_frames: int | None = None) -> str:
+    """Downloads a video and extracts N evenly-spaced frames to local files.
+
+    Use this for the VISUAL content of a video (charts, diagrams, on-screen
+    text, people/objects). For the SPOKEN content use 'get_youtube_transcript'
+    instead. The sampled frames are written to the video-frames folder and can
+    be read one-by-one with 'inspect_image'. Requires yt-dlp and
+    ffmpeg/ffprobe on PATH.
+
+    Args:
+        video_url: The full URL of the video (e.g., 'https://www.youtube.com/watch?v=...').
+        num_frames: Number of evenly-spaced frames to extract (defaults to the
+            VIDEO_FRAMES_COUNT setting, usually 4).
+    """
+    job_id = None
+    try:
+        import yt_dlp
+
+        n = _resolve_frame_count(num_frames)
+        os.makedirs(VIDEO_FRAMES_DIR, exist_ok=True)
+        job_id = str(int(time.time() * 1000))
+        base_prefix = os.path.join(VIDEO_FRAMES_DIR, f"video_{job_id}")
+
+        # Download the video. Bounding the height keeps the download small and
+        # fast; noplaylist avoids pulling an entire playlist for one clip.
+        ydl_opts = {
+            "format": "bv*[height<=720]+ba/b[height<=720]/b",
+            "outtmpl": base_prefix + ".%(ext)s",
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "merge_output_format": "mp4",
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(video_url, download=True)
+
+        # Locate the actual downloaded file (the final extension depends on the
+        # stream/merge chosen by yt-dlp, so glob for our prefix)
+        downloaded = [
+            os.path.join(VIDEO_FRAMES_DIR, f)
+            for f in os.listdir(VIDEO_FRAMES_DIR)
+            if f.startswith(os.path.basename(base_prefix))
+        ]
+        if not downloaded:
+            return f"Error: Download completed but no video file was found for {video_url}"
+        video_path = downloaded[0]
+
+        try:
+            # Probe the duration, then sample N evenly-spaced frame timestamps
+            frame_paths = _extract_frames_from_video(video_path, n, job_id)
+        finally:
+            # The source video is no longer needed once frames are extracted
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
+
+        lines = [f"Extracted {len(frame_paths)} evenly-spaced frames from the video:"]
+        lines += [f"  - {p}" for p in frame_paths]
+        lines.append("Inspect each frame with 'inspect_image' to read its visual content.")
+        return "\n".join(lines)
+    except Exception as e:
+        # Clean up this job's partial artifacts so failures never orphan files
+        if job_id:
+            _cleanup_job_artifacts(job_id)
+        return f"Error extracting video frames: {e}"
 
 @tool
 def inspect_pdf(pdf_path: str) -> str:
@@ -864,8 +1118,9 @@ class GAIASolverAgent:
             tools=[
                 DuckDuckGoSearchTool(), # Web search tool
                 VisitWebpageTool(),     # Web scraping/browsing tool
-                transcribe_audio,       # Audio transcription tool
-                get_youtube_transcript, # YouTube transcript extraction tool
+                transcribe_audio,       # Audio transcription tool (local faster-whisper)
+                get_youtube_transcript, # YouTube transcript extraction tool (spoken content)
+                extract_video_frames,   # Video frame-sampling tool (visual content)
                 inspect_pdf,            # PDF text extraction tool
                 inspect_excel,          # Excel sheet inspector tool
                 read_file_as_text,      # General text/CSV/JSON reader tool
@@ -968,7 +1223,7 @@ class GAIASolverAgent:
                 if ext in ('png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'):
                     prompt += f"🖼️ IMAGE saved at '{file_path}'. Use 'inspect_image' with the task question to extract its content.\n\n"
                 elif ext in ('mp3', 'wav', 'm4a', 'ogg', 'flac'):
-                    prompt += f"🎙️ AUDIO saved at '{file_path}'. Use 'transcribe_audio'.\n\n"
+                    prompt += f"🎙️ AUDIO saved at '{file_path}'. Use 'transcribe_audio' (local faster-whisper).\n\n"
                 elif ext in ('pdf',):
                     prompt += f"📄 PDF saved at '{file_path}'. Use 'inspect_pdf' or Python libraries like pdfplumber/fitz.\n\n"
                 elif ext in ('xlsx', 'xls'):
@@ -985,7 +1240,12 @@ class GAIASolverAgent:
                 prompt += f"⚠️ Note: Attachment '{file_name}' was specified but not found locally in files directory.\n\n"
 
             if "youtube.com" in question.lower() or "youtu.be" in question.lower():
-                prompt += "📹 YOUTUBE: Use 'get_youtube_transcript' to process the link.\n\n"
+                prompt += (
+                    "📹 YOUTUBE: Use 'get_youtube_transcript' for the SPOKEN content, "
+                    "and 'extract_video_frames' to sample frames if the answer depends "
+                    "on VISUAL content (charts, diagrams, on-screen text). Use whichever "
+                    "the Question needs — or both.\n\n"
+                )
 
             prompt += "CRITICAL INSTRUCTIONS:\n1. Answer concisely.\n2. Provide the exact data required.\n"
 

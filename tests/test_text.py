@@ -7,10 +7,14 @@ plus the hardening helpers introduced for the ticket: safe archive extraction
 (`_safe_extract_all`) and retry-with-backoff (`_call_with_retry`).
 """
 
+import os
+import shutil
+import subprocess
 import zipfile
 
 import pytest
 import requests
+from PIL import Image
 
 import text
 
@@ -274,3 +278,114 @@ class TestGetLocalTaskFile:
     def test_no_file_returns_empty(self, tmp_path, monkeypatch):
         monkeypatch.setattr(text, "LOCAL_FILES_DIR", str(tmp_path))
         assert text._get_local_task_file("t1", "missing.pdf") == ""
+
+
+# ─── Video frame timestamps (ticket 02) ──────────────────────────────
+class TestVideoFrameTimestamps:
+    def test_evenly_spaced_center_timestamps(self):
+        # 4 frames over 10s → centers of 4 equal slices
+        assert text._video_frame_timestamps(10.0, 4) == [1.25, 3.75, 6.25, 8.75]
+
+    def test_single_frame_is_middle_of_video(self):
+        assert text._video_frame_timestamps(10.0, 1) == [5.0]
+
+    def test_num_frames_below_one_clamps_to_one(self):
+        assert text._video_frame_timestamps(10.0, 0) == [5.0]
+
+    def test_negative_duration_returns_zero(self):
+        assert text._video_frame_timestamps(-3.0, 4) == [0.0]
+
+    def test_zero_duration_returns_zero(self):
+        assert text._video_frame_timestamps(0.0, 4) == [0.0]
+
+    def test_all_timestamps_stay_within_duration(self):
+        ts = text._video_frame_timestamps(2.0, 8)
+        assert len(ts) == 8
+        assert all(0.0 <= t <= 2.0 for t in ts)
+        # Ascending and distinct
+        assert ts == sorted(ts)
+        assert len(set(ts)) == 8
+
+    def test_short_video_many_frames_never_exceeds_duration(self):
+        ts = text._video_frame_timestamps(1.0, 100)
+        assert all(0.0 <= t <= 1.0 for t in ts)
+        assert len(ts) == 100
+
+
+# ─── Audio transcription routing (ticket 02) ─────────────────────────
+class TestTranscribeAudioRouting:
+    def test_uses_local_model_by_default(self, monkeypatch):
+        monkeypatch.setattr(text, "USE_WHISPER_API", False)
+        monkeypatch.setattr(text, "_transcribe_audio_local", lambda p: "local transcript")
+        monkeypatch.setattr(text, "_transcribe_audio_api", lambda p: "api transcript")
+        assert text.transcribe_audio("file.mp3") == "local transcript"
+
+    def test_uses_api_when_opt_in(self, monkeypatch):
+        monkeypatch.setattr(text, "USE_WHISPER_API", True)
+        monkeypatch.setattr(text, "_transcribe_audio_local", lambda p: "local transcript")
+        monkeypatch.setattr(text, "_transcribe_audio_api", lambda p: "api transcript")
+        assert text.transcribe_audio("file.mp3") == "api transcript"
+
+    def test_falls_back_to_api_when_local_fails_and_key_set(self, monkeypatch):
+        monkeypatch.setattr(text, "USE_WHISPER_API", False)
+        monkeypatch.setattr(text, "_transcribe_audio_local", lambda p: "Error: local failed")
+        monkeypatch.setattr(text, "_transcribe_audio_api", lambda p: "api transcript")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        assert text.transcribe_audio("file.mp3") == "api transcript"
+
+    def test_returns_local_error_when_no_api_key(self, monkeypatch):
+        monkeypatch.setattr(text, "USE_WHISPER_API", False)
+        monkeypatch.setattr(text, "_transcribe_audio_local", lambda p: "Error: local failed")
+        monkeypatch.setattr(text, "_transcribe_audio_api", lambda p: "api transcript")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        assert text.transcribe_audio("file.mp3") == "Error: local failed"
+
+
+# ─── Frame-count resolution (ticket 02) ───────────────────────────────
+class TestResolveFrameCount:
+    def test_none_uses_config(self, monkeypatch):
+        monkeypatch.setattr(text, "VIDEO_FRAMES_COUNT", 4)
+        assert text._resolve_frame_count(None) == 4
+
+    def test_positive_int_is_used(self, monkeypatch):
+        monkeypatch.setattr(text, "VIDEO_FRAMES_COUNT", 4)
+        assert text._resolve_frame_count(6) == 6
+
+    def test_zero_falls_back_to_config(self, monkeypatch):
+        monkeypatch.setattr(text, "VIDEO_FRAMES_COUNT", 4)
+        assert text._resolve_frame_count(0) == 4
+
+    def test_non_numeric_falls_back_to_config(self, monkeypatch):
+        monkeypatch.setattr(text, "VIDEO_FRAMES_COUNT", 4)
+        assert text._resolve_frame_count("banana") == 4
+
+    def test_float_string_falls_back_to_config(self, monkeypatch):
+        monkeypatch.setattr(text, "VIDEO_FRAMES_COUNT", 4)
+        assert text._resolve_frame_count("5.5") == 4
+
+
+# ─── Video frame extraction (ticket 02) ───────────────────────────────
+class TestExtractFramesFromVideo:
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not on PATH")
+    def test_extracts_evenly_spaced_frames_from_local_video(self, tmp_path):
+        # Generate a tiny 2-second test clip without touching the network
+        video_path = tmp_path / "clip.mp4"
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", "testsrc=duration=2:size=64x64:rate=5",
+             "-pix_fmt", "yuv420p", str(video_path)],
+            check=True,
+        )
+
+        out_dir = tmp_path / "frames"
+        frames = text._extract_frames_from_video(str(video_path), 2, "jobtest", str(out_dir))
+
+        assert len(frames) == 2
+        assert sorted(os.path.basename(p) for p in frames) == [
+            "frame_jobtest_01.jpg",
+            "frame_jobtest_02.jpg",
+        ]
+        for p in frames:
+            assert os.path.exists(p)
+            Image.open(p).verify()  # each frame is a valid image file
