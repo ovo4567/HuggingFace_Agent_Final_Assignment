@@ -1,0 +1,1159 @@
+"""
+GAIA Solver Pro — Autonomous Multi-Tool Agent
+Engine: DeepSeek API (deepseek-chat)
+Designed for the GAIA Benchmark with CSV output (Asynchronous/Concurrent Execution)
+"""
+
+# Import operating system utilities (for file paths and environment variables)
+import os
+
+# Import regular expressions library for text manipulation and string cleaning
+import re
+
+# Import JSON parsing library for handling structured data
+import json
+
+# Import time module to measure task execution duration
+import time
+
+# Import random module for jittered retry backoff delays
+import random
+
+# Import shutil for safe archive extraction (streaming member writes)
+import shutil
+
+# Import queue module for thread-safe worker pooling in parallel execution
+import queue
+
+# Import threading module for the shared vision-model lock
+import threading
+
+# Import HTTP requests library to make API calls and download files
+import requests
+
+# Import pandas for data processing, CSV exporting, and Excel reading
+import pandas as pd
+
+# Import PIL Image for handling image files when working with visual models
+from PIL import Image
+
+# Import thread pool executor tools for concurrent multithreaded processing
+from concurrent.futures import ThreadPoolExecutor
+
+# Import core agent tools and framework wrappers from the smolagents framework
+from smolagents import CodeAgent, OpenAIServerModel, DuckDuckGoSearchTool, VisitWebpageTool, tool
+
+# Import dotenv to load environment variables from a local .env file
+from dotenv import load_dotenv
+
+# Load secret environment variables (like API keys) into os.environ
+load_dotenv()
+
+# ─── DeepSeek API Configuration ──────────────────────────────────────
+# Set default endpoint URL where the GAIA benchmark questions & files are hosted
+DEFAULT_API_URL = os.getenv("GAIA_API_URL", "https://agents-course-unit4-scoring.hf.space")
+
+# Retrieve the DeepSeek API key from environment variables
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
+# Set base URL for the DeepSeek API (OpenAI-compatible endpoint)
+DEEPSEEK_API_BASE = os.getenv("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1")
+
+# Specify the main LLM model name used for agent reasoning and execution
+AGENT_MODEL = os.getenv("DEEPSEEK_AGENT_MODEL", "deepseek-chat")
+
+# Specify the LLM model name used for formatting the final string answer
+CLEANING_MODEL = os.getenv("DEEPSEEK_CLEANING_MODEL", "deepseek-chat")
+
+# Number of parallel worker agents used by the pipeline
+NUM_WORKERS = int(os.getenv("GAIA_NUM_WORKERS", "4"))
+
+# Maximum tokens allowed for the answer-cleaning pass (raised so long
+# comma-separated list Answers are not truncated)
+CLEANING_MAX_TOKENS = int(os.getenv("CLEANING_MAX_TOKENS", "1024"))
+
+# Per-Task safety timeout in seconds: a stuck Agent/network call must not
+# block a worker (or the whole Run) indefinitely
+TASK_TIMEOUT_SEC = float(os.getenv("GAIA_TASK_TIMEOUT", "600"))
+
+# Local vision model used by the 'inspect_image' tool for image attachments
+VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "Qwen/Qwen2-VL-2B-Instruct")
+
+# ─── Prompt for Final Answer Cleaning ──────────────────────────────────
+# System prompt template that instructs LLM how to format outputs strictly for benchmark submission
+FINAL_ANSWER_PROMPT = """You are an expert assistant in generating final answers with the highest possible precision.
+Given a question and an initial answer, your task is to generate the clean final answer.
+
+**Rules:**
+- The final answer must be a number and/or text string OR as few words as possible OR a comma-separated list.
+- If a number is requested, DO NOT use commas to separate thousands NOR units like USD, $, percentage, or % unless specified.
+- If a string is requested, DO NOT use articles or abbreviations, write digits in plain text unless specified.
+- If a comma-separated list is requested, apply the previous rules depending on whether it is a number or a string.
+- If the final answer is a number, use a number, not a word.
+- If the final answer is a string, start with a capital letter.
+- If the final answer is a comma-separated list of numbers, put a space after each comma.
+- If the final answer is a comma-separated list of strings, put a space after each comma and start with a lowercase letter.
+- DO NOT add content that is not in the initial answer.
+
+**Examples:**
+Question: What is the largest city in California?
+Initial Answer: The largest city in California is Los Angeles.
+Final Answer: Los Angeles
+
+Question: How many 'r's are in strawberry?
+Initial Answer: There are 3 'r's in strawberry.
+Final Answer: 3
+
+Question: {question}
+Initial Answer: {answer}
+Final Answer: """
+
+# Tuples of prefixes commonly outputted by reasoners to strip during cleanup
+ANSWER_PREFIXES = (
+    "Final Answer:",
+    "FINAL ANSWER:",
+    "Answer:",
+    "Respuesta Final:",
+)
+
+def _extract_youtube_video_id(youtube_url: str) -> str | None:
+    """Extracts a YouTube video ID from watch, short, embed, or live URLs."""
+    # Import URL parsing components inside function scope
+    from urllib.parse import parse_qs, urlparse
+
+    # Parse the input YouTube URL string into structured URL components
+    parsed = urlparse(youtube_url)
+    
+    # Get domain host name in lowercase (e.g., youtube.com or youtu.be)
+    host = (parsed.netloc or "").lower()
+    
+    # Get the URL path string (e.g., /watch or /shorts/xyz)
+    path = parsed.path or ""
+
+    # Check if the URL is a short link (youtu.be/ID)
+    if "youtu.be" in host:
+        # Extract ID from the path segment
+        video_id = path.strip("/").split("/")[0]
+        return video_id or None
+
+    # Check if URL belongs to standard youtube.com domains
+    if "youtube.com" in host:
+        # Try extracting query parameter 'v' from ?v=VIDEO_ID
+        query_id = parse_qs(parsed.query).get("v", [None])[0]
+        if query_id:
+            return query_id
+        
+        # Check path-based formats like /shorts/, /embed/, /live/
+        for prefix in ("/shorts/", "/embed/", "/live/"):
+            if path.startswith(prefix):
+                video_id = path[len(prefix):].split("/")[0]
+                return video_id or None
+
+    # Fallback: regex search for standard 11-character video IDs
+    match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})", youtube_url)
+    # Return matched ID if found, otherwise None
+    return match.group(1) if match else None
+
+def _get_transcript_text(transcript_data) -> str:
+    """Normalizes different versions of youtube_transcript_api into a single string."""
+    # Convert transcript object to raw list of dictionaries if method exists
+    if hasattr(transcript_data, "to_raw_data"):
+        segments = transcript_data.to_raw_data()
+    else:
+        segments = transcript_data
+
+    # List to hold individual text lines
+    parts = []
+    # Loop over every subtitle segment retrieved
+    for segment in segments:
+        # Extract text property or dictionary key depending on API version return type
+        if hasattr(segment, "text"):
+            text = segment.text
+        elif isinstance(segment, dict):
+            text = segment.get("text", "")
+        else:
+            text = str(segment)
+        
+        # Trim leading and trailing whitespace
+        text = str(text).strip()
+        # If segment contains text, append it to collector list
+        if text:
+            parts.append(text)
+            
+    # Combine all segments into a single space-delimited text paragraph
+    return " ".join(parts).strip()
+
+
+# Define local folder path where all attachment files are stored (relative to this script)
+LOCAL_FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+
+def _get_local_task_file(task_id: str, file_name: str) -> str:
+    """Locates a pre-downloaded file in the local files directory.
+    
+    Checks both original file_name and task_id-based filenames.
+    """
+    if not os.path.exists(LOCAL_FILES_DIR):
+        return ""
+
+    # Strategy 1: Check by exact file_name if present
+    if file_name and str(file_name).strip():
+        safe_name = os.path.basename(file_name)
+        p1 = os.path.join(LOCAL_FILES_DIR, safe_name)
+        if os.path.exists(p1):
+            return p1
+
+    # Strategy 2: Check by task_id + extension from file_name (e.g., 2b3ef98c-....mp3)
+    if task_id:
+        if file_name and "." in file_name:
+            ext = file_name.lower().split(".")[-1]
+            p2 = os.path.join(LOCAL_FILES_DIR, f"{task_id}.{ext}")
+            if os.path.exists(p2):
+                return p2
+
+        # Strategy 3: Check by task_id alone
+        p3 = os.path.join(LOCAL_FILES_DIR, task_id)
+        if os.path.exists(p3):
+            return p3
+
+        # Strategy 4: Search for any file in the folder starting with task_id
+        for existing_file in os.listdir(LOCAL_FILES_DIR):
+            if existing_file.startswith(task_id):
+                return os.path.join(LOCAL_FILES_DIR, existing_file)
+
+    return ""
+
+
+def _normalize_answer_for_submission(answer: str | None) -> str:
+    """Ensures only the clean answer is processed by removing thinking tags."""
+    # Handle None value safely and strip whitespace from answer string
+    text = "" if answer is None else str(answer).strip()
+    
+    # Strip <think>...</think> reasoning blocks from DeepSeek R1 models using regex
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    
+    # Clean orphaned closing tags if leftover
+    text = re.sub(r'</think>', '', text).strip()
+    
+    # Clean orphaned opening tags if leftover
+    text = re.sub(r'<think>', '', text).strip()
+
+    # Iterate over standard answer prefixes and remove them if present
+    for prefix in ANSWER_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            
+    # Strip residual code ticks and bold asterisks surrounding answer
+    text = text.strip("`*")
+    
+    # Return normalized clean text string
+    return text
+
+
+# Sentinel placeholders used to interpolate values into FINAL_ANSWER_PROMPT.
+# Swapping the template's {question}/{answer} markers for these control-char
+# sentinels first means a Question or Answer that itself contains the literal
+# substrings "{question}"/"{answer}" cannot be double-substituted.
+_PROMPT_QUESTION_SENTINEL = "\x00GAIA_QUESTION\x00"
+_PROMPT_ANSWER_SENTINEL = "\x00GAIA_ANSWER\x00"
+
+def _build_cleaning_prompt(question: str | None, answer: str | None) -> str:
+    """Builds the final-answer cleaning prompt.
+
+    Interpolates the Question and raw Answer via string replacement (never
+    ``str.format``), so Answers containing ``{`` or ``}`` (e.g. JSON or sets)
+    do not crash the cleaning pass.
+    """
+    prompt = (
+        FINAL_ANSWER_PROMPT
+        .replace("{question}", _PROMPT_QUESTION_SENTINEL)
+        .replace("{answer}", _PROMPT_ANSWER_SENTINEL)
+        .replace(_PROMPT_QUESTION_SENTINEL, "" if question is None else str(question))
+        .replace(_PROMPT_ANSWER_SENTINEL, "" if answer is None else str(answer))
+    )
+    return prompt
+
+
+# ─── Retry-with-backoff ───────────────────────────────────────────────
+# Transient model/network failures (429 rate limits, connection drops,
+# timeouts, 5xx) must not fail a Task and cost a point. smolagents retries
+# rate-limit errors internally, but not network errors; the answer-cleaning
+# call uses the raw OpenAI client and has no built-in retry at all. These
+# helpers give both paths a uniform retry-with-backoff.
+_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+# Message markers that indicate a transient failure when the exception type
+# cannot be classified directly (e.g. wrapped/unknown errors).
+_RETRYABLE_MESSAGE_MARKERS = (
+    "429",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "500",
+    "502",
+    "503",
+    "504",
+    "internal server error",
+    "service unavailable",
+    "connection",
+    "timeout",
+    "timed out",
+    "temporarily unavailable",
+)
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    """Returns True when ``exc`` is a transient model/network failure worth retrying."""
+    try:
+        from openai import APIConnectionError, APITimeoutError, RateLimitError, APIStatusError
+        retryable_classes = (APIConnectionError, APITimeoutError, RateLimitError)
+    except Exception:
+        retryable_classes = ()
+        APIStatusError = None
+
+    # OpenAI SDK transient error classes
+    if retryable_classes and isinstance(exc, retryable_classes):
+        return True
+    if APIStatusError is not None and isinstance(exc, APIStatusError):
+        status = getattr(exc, "status_code", None)
+        if status is not None:
+            return status in _RETRYABLE_STATUS_CODES
+
+    # requests-level errors: retry connection drops and timeouts, and HTTP
+    # 5xx/429 surfaced by raise_for_status(), but not permanent 4xx client errors
+    if isinstance(exc, requests.exceptions.HTTPError):
+        status = getattr(exc.response, "status_code", None)
+        if status is not None:
+            return status in _RETRYABLE_STATUS_CODES
+        return False
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+
+    # Fallback heuristic: recognizable markers in the message text
+    message = str(exc).lower()
+    return any(marker in message for marker in _RETRYABLE_MESSAGE_MARKERS)
+
+def _call_with_retry(fn, *, max_attempts: int = 4, base_delay: float = 1.0,
+                     max_delay: float = 30.0, jitter: float = 0.5,
+                     description: str = "call"):
+    """Calls ``fn``, retrying transient errors with exponential backoff + jitter.
+
+    Args:
+        fn: The callable to invoke (must be re-invocable).
+        max_attempts: Total attempts before giving up (default 4).
+        base_delay: Base backoff seconds, doubled after each failure.
+        max_delay: Ceiling on the backoff delay.
+        jitter: +/- fraction of the delay applied as random jitter.
+        description: Human-readable label used in retry log messages.
+
+    Returns:
+        Whatever ``fn`` returns on success.
+
+    Raises:
+        The last exception raised by ``fn`` once retries are exhausted or the
+        error is not transient.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return fn()
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_retryable_error(exc):
+                raise
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            delay *= 1.0 + jitter * (2.0 * random.random() - 1.0)
+            print(f"⚠️ {description} failed (attempt {attempt}/{max_attempts}): {exc}; "
+                  f"retrying in {max(0.0, delay):.1f}s")
+            time.sleep(max(0.0, delay))
+
+
+def _run_with_timeout(fn, timeout: float):
+    """Runs ``fn`` on a daemon helper thread, bounding its runtime to ``timeout``.
+
+    Python cannot forcibly kill a thread blocked in a call (e.g. a hung HTTP
+    request), so the call runs on a short-lived **daemon** thread that the
+    caller joins with a timeout. If the call is still alive when the timeout
+    elapses, ``TimeoutError`` is raised and the caller moves on; the wedged
+    helper thread cannot block the worker or the process at exit (daemon).
+
+    Returns:
+        Whatever ``fn`` returns on success.
+
+    Raises:
+        ``TimeoutError`` if ``fn`` does not finish within ``timeout`` seconds.
+        Any exception raised by ``fn`` otherwise.
+    """
+    result_box = {}
+
+    def _target():
+        try:
+            result_box["value"] = fn()
+        except Exception as exc:
+            result_box["error"] = exc
+
+    helper = threading.Thread(target=_target, daemon=True)
+    helper.start()
+    helper.join(timeout)
+
+    if helper.is_alive():
+        raise TimeoutError(f"Task exceeded {timeout:.0f}s")
+    if "error" in result_box:
+        raise result_box["error"]
+    return result_box["value"]
+
+# ─── Agent Tools ──────────────────────────────────────────────────
+@tool
+def transcribe_audio(audio_path: str) -> str: 
+    """Transcribes an audio file (MP3, WAV, M4A, etc.) using the external OpenAI/Whisper API.
+
+    Args:
+        audio_path: The local path to the audio file (e.g., 'downloads/file.mp3').
+    """
+    try:
+        # Import openai library inside tool execution logic
+        import openai
+        
+        # Check for OpenAI or OpenRouter API keys (for Whisper transcription only;
+        # separate from the DeepSeek agent config since DeepSeek has no audio API)
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        
+        # Select base API endpoint depending on which service key is set
+        base_url = "https://api.openai.com/v1" if os.getenv("OPENAI_API_KEY") else "https://openrouter.ai/api/v1"
+        
+        # Choose Whisper model based on API provider
+        model = "whisper-1" if os.getenv("OPENAI_API_KEY") else "openai/whisper-large-v3-turbo"
+        
+        # Return warning message if neither API key is present
+        if not api_key:
+            return "Error: Transcribing audio requires configuring OPENAI_API_KEY or OPENROUTER_API_KEY."
+
+        # Instantiate OpenAI client with configured API host & key
+        client = openai.OpenAI(base_url=base_url, api_key=api_key)
+        
+        # Open target audio file in binary reading mode
+        with open(audio_path, "rb") as audio_file:
+            # Request audio transcription from Whisper model endpoint
+            transcription = client.audio.transcriptions.create(
+                model=model,
+                file=audio_file,
+            )
+            
+        # Return transcript text content
+        return transcription.text
+    except Exception as e:
+        # Return error string if transcription fails
+        return f"Error transcribing audio: {e}"
+
+@tool
+def get_youtube_transcript(youtube_url: str) -> str:
+    """Gets the official transcript/subtitles of a YouTube video.
+
+    Args:
+        youtube_url: The full URL of the YouTube video (e.g., 'https://www.youtube.com/watch?v=...').
+    """
+    try:
+        # Import YouTube transcript API library
+        from youtube_transcript_api import YouTubeTranscriptApi
+        
+        # Extract video ID from input URL string using helper function
+        video_id = _extract_youtube_video_id(youtube_url)
+        if not video_id:
+            return f"Error: Could not extract video ID from URL: {youtube_url}"
+
+        # Preference list of subtitle languages to query
+        preferred_languages = ['en', 'es', 'fr', 'de']
+        try:
+            # Attempt direct fetching of preferred language subtitles
+            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=preferred_languages)
+        except Exception:
+            # Fallback: list available transcripts and fetch best matching language
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript = transcript_list.find_transcript(preferred_languages).fetch()
+
+        # Normalize fetched transcript object into single text string
+        return _get_transcript_text(transcript)
+    except Exception as e:
+        # Return error description string if retrieval fails
+        return f"Error obtaining YouTube transcript: {e}."
+
+@tool
+def inspect_pdf(pdf_path: str) -> str:
+    """Extracts all text from a PDF file in a structured format.
+
+    Args:
+        pdf_path: The local path to the PDF file (e.g., 'downloads/document.pdf').
+    """
+    try:
+        # Import pdfplumber library for text extraction
+        import pdfplumber
+        
+        # Container to accumulate text page by page
+        texts = []
+        
+        # Open PDF file in pdfplumber handle context
+        with pdfplumber.open(pdf_path) as pdf:
+            # Iterate through each page of document with index
+            for i, page in enumerate(pdf.pages):
+                # Extract text content from current page
+                content = page.extract_text()
+                if content:
+                    # Append formatted header with page content
+                    texts.append(f"--- Page {i+1} ---\n{content}")
+                    
+        # Join extracted page texts and truncate to 60,000 chars to avoid prompt context blowup
+        return "\n".join(texts)[:60000]
+    except Exception as e:
+        # Return error message if reading PDF fails
+        return f"Error reading PDF: {e}"
+
+@tool
+def inspect_excel(file_path: str) -> str:
+    """Reads an Excel file (.xlsx, .xls) and returns a summary of its sheets.
+
+    Args:
+        file_path: The local path to the Excel file (e.g., 'downloads/data.xlsx').
+    """
+    try:
+        # Load Excel workbook structure into pandas ExcelFile reader
+        xl = pd.ExcelFile(file_path)
+        
+        # Start summary list with sheet names found
+        summary = [f"Sheets found: {xl.sheet_names}"]
+        
+        # Loop through each sheet name inside workbook
+        for sheet in xl.sheet_names:
+            # Read first 20 rows of current sheet into DataFrame
+            df = pd.read_excel(xl, sheet_name=sheet).head(20)
+            # Format sheet header and sample string table into summary
+            summary.append(f"\n--- Sheet: {sheet} (Sample) ---\n{df.to_string()}")
+            
+        # Return joined summary string capped at 50,000 characters max
+        return "\n".join(summary)[:50000]
+    except Exception as e:
+        # Return error message string if Excel read fails
+        return f"Error reading Excel: {e}"
+
+@tool
+def read_file_as_text(file_path: str) -> str:
+    """Reads a plain text file like CSV, JSON, TXT, etc.
+
+    Args:
+        file_path: The local path to the text file (e.g., 'downloads/report.csv').
+    """
+    try:
+        # Open target text file with UTF-8 encoding, replacing invalid characters
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+            
+        # Truncate content to 50,000 characters if file is too large
+        if len(content) > 50000:
+            content = content[:50000] + "\n...[CONTENT TRUNCATED]..."
+            
+        # Return file text contents
+        return content
+    except Exception as e:
+        # Return error message string if text read fails
+        return f"Error reading file: {e}"
+
+# Shared vision model singletons (loaded once, reused across all worker threads)
+_vision_model = None
+_vision_processor = None
+_vision_lock = threading.Lock()
+
+@tool
+def inspect_image(image_path: str, question: str = "") -> str:
+    """Extracts the content of an image using a local vision model (Qwen2-VL-2B) plus OCR.
+
+    Use this tool for image attachments (.png, .jpg, .jpeg, etc.). Pass the task
+    question so the model focuses on the exact detail needed for the answer.
+
+    Args:
+        image_path: The local path to the image file (e.g., 'downloads/image.png').
+        question: The task question to focus the extraction on (optional).
+    """
+    global _vision_model, _vision_processor
+
+    try:
+        # Import heavy libraries only when the tool is first invoked
+        import torch
+        from transformers import AutoProcessor
+
+        # Resolve the correct auto class (newer transformers name, with older fallback)
+        try:
+            from transformers import AutoModelForImageTextToText as _AutoVL
+        except ImportError:
+            from transformers import AutoModelForVision2Seq as _AutoVL
+
+        # ── Load the shared model + processor once (double-checked locking) ──
+        if _vision_model is None:
+            with _vision_lock:
+                if _vision_model is None:
+                    device = "cuda" if torch.cuda.is_available() else "cpu"
+                    dtype = torch.float16 if device == "cuda" else torch.float32
+
+                    _vision_processor = AutoProcessor.from_pretrained(VISION_MODEL_ID)
+                    _vision_model = _AutoVL.from_pretrained(
+                        VISION_MODEL_ID,
+                        torch_dtype=dtype,
+                        device_map="auto" if device == "cuda" else None,
+                    )
+                    _vision_model.eval()
+                    if device == "cpu":
+                        _vision_model.to("cpu")
+
+        # ── Open the image and normalize to RGB ──
+        image = Image.open(image_path).convert("RGB")
+
+        # ── Build a question-directed prompt for the VLM ──
+        if question and str(question).strip():
+            prompt_text = (
+                "Look carefully at this image and answer the following question. "
+                "Extract the exact text, numbers, names, or details shown in the image "
+                "that are needed to answer. Be precise and do not guess.\n"
+                f"Question: {question}"
+            )
+        else:
+            prompt_text = (
+                "Describe the contents of this image in detail. "
+                "Include all visible text, numbers, labels, and names exactly as shown."
+            )
+
+        # ── Run inference (serialized across worker threads) ──
+        with _vision_lock:
+            try:
+                # Preferred path: chat template (Qwen2-VL style)
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }]
+                text = _vision_processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                inputs = _vision_processor(
+                    text=[text], images=[image], return_tensors="pt"
+                )
+            except (AttributeError, NotImplementedError):
+                # Fallback path: plain image + text inputs
+                inputs = _vision_processor(
+                    images=image, text=prompt_text, return_tensors="pt"
+                )
+
+            # Move inputs to GPU if available
+            if torch.cuda.is_available():
+                inputs = {
+                    k: v.to("cuda") for k, v in inputs.items()
+                    if isinstance(v, torch.Tensor)
+                }
+
+            with torch.no_grad():
+                outputs = _vision_model.generate(
+                    **inputs,
+                    max_new_tokens=512,
+                    do_sample=False,
+                )
+
+            # Decode only the newly generated tokens
+            input_len = inputs["input_ids"].shape[1]
+            generated = _vision_processor.batch_decode(
+                outputs[:, input_len:], skip_special_tokens=True
+            )
+            vlm_text = " ".join(generated).strip()
+
+        # ── Best-effort OCR pass for literal text ──
+        ocr_text = ""
+        try:
+            import pytesseract
+            ocr_text = pytesseract.image_to_string(image).strip()
+            if len(ocr_text) > 3000:
+                ocr_text = ocr_text[:3000] + "\n...[OCR TRUNCATED]..."
+        except Exception:
+            ocr_text = ""  # OCR unavailable (e.g., Tesseract binary not installed)
+
+        # ── Combine results and cap the total length ──
+        result = f"VISION MODEL OUTPUT:\n{vlm_text}"
+        if ocr_text:
+            result += f"\n\nOCR TEXT:\n{ocr_text}"
+        return result[:8000]
+    except Exception as e:
+        return f"Error analyzing image: {e}"
+
+@tool
+def inspect_docx(file_path: str) -> str:
+    """Extracts all text (paragraphs and tables) from a Word .docx file.
+
+    Args:
+        file_path: The local path to the .docx file (e.g., 'downloads/document.docx').
+    """
+    try:
+        # Import python-docx library inside tool execution logic
+        import docx
+
+        # Open the Word document
+        document = docx.Document(file_path)
+
+        # Container for extracted text parts
+        parts = []
+
+        # Collect non-empty paragraphs
+        for para in document.paragraphs:
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+
+        # Collect table contents row by row
+        for t_idx, table in enumerate(document.tables):
+            parts.append(f"\n--- Table {t_idx + 1} ---")
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                parts.append(" | ".join(cells))
+
+        # Return joined text capped at 50,000 characters
+        return "\n".join(parts)[:50000]
+    except Exception as e:
+        # Return error message if .docx reading fails
+        return f"Error reading .docx: {e}"
+
+@tool
+def inspect_pptx(file_path: str) -> str:
+    """Extracts all text from each slide of a PowerPoint .pptx file.
+
+    Args:
+        file_path: The local path to the .pptx file (e.g., 'downloads/presentation.pptx').
+    """
+    try:
+        # Import python-pptx library inside tool execution logic
+        from pptx import Presentation
+
+        # Open the PowerPoint presentation
+        prs = Presentation(file_path)
+
+        # Container for extracted slide text
+        parts = []
+
+        # Loop over every slide with its index
+        for s_idx, slide in enumerate(prs.slides):
+            slide_texts = []
+            # Iterate shapes (text boxes, tables, etc.) in the slide
+            for shape in slide.shapes:
+                if hasattr(shape, "text") and shape.text.strip():
+                    slide_texts.append(shape.text.strip())
+            if slide_texts:
+                # Append formatted slide header with its text lines
+                parts.append(f"--- Slide {s_idx + 1} ---\n" + "\n".join(slide_texts))
+
+        # Return joined slide text capped at 50,000 characters
+        return "\n\n".join(parts)[:50000]
+    except Exception as e:
+        # Return error message if .pptx reading fails
+        return f"Error reading .pptx: {e}"
+
+def _safe_extract_all(zf, extract_dir: str) -> tuple[list[str], list[str]]:
+    """Extracts every member of an open ``zipfile.ZipFile`` without path traversal.
+
+    Never uses ``extractall()``: each member's resolved destination is checked
+    to stay inside ``extract_dir``, absolute paths and ``..`` traversal are
+    rejected, and members are streamed out as plain files so symlink entries
+    cannot be followed outside the extraction folder.
+
+    Returns:
+        A ``(extracted, skipped)`` pair: the names of members written, and the
+        names of unsafe members that were rejected.
+    """
+    base = os.path.realpath(extract_dir)
+    os.makedirs(base, exist_ok=True)
+
+    extracted: list[str] = []
+    skipped: list[str] = []
+
+    for member in zf.infolist():
+        # Normalize Windows separators and reject absolute/escaping paths
+        member_path = member.filename.replace("\\", "/")
+        if member_path.startswith("/") or ".." in member_path.split("/"):
+            skipped.append(member.filename)
+            continue
+
+        target = os.path.realpath(os.path.join(base, member_path))
+        # Guard: resolved target must stay inside the extraction folder
+        if not (target == base or target.startswith(base + os.sep)):
+            skipped.append(member.filename)
+            continue
+
+        if member.is_dir():
+            os.makedirs(target, exist_ok=True)
+            extracted.append(member.filename)
+            continue
+
+        # Stream the member out as a plain file (never follow symlinks)
+        os.makedirs(os.path.dirname(target) or base, exist_ok=True)
+        with zf.open(member, "r") as src, open(target, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        extracted.append(member.filename)
+
+    return extracted, skipped
+
+@tool
+def extract_zip(zip_path: str, extract_dir: str = "") -> str:
+    """Lists and extracts the contents of a .zip archive into a folder.
+
+    Args:
+        zip_path: The local path to the .zip file (e.g., 'downloads/files.zip').
+        extract_dir: The folder to extract into (defaults to the files directory).
+    """
+    try:
+        # Import zipfile library inside tool execution logic
+        import zipfile
+
+        # Default extraction folder next to the attachment files
+        if not extract_dir:
+            extract_dir = os.path.join(LOCAL_FILES_DIR, "_extracted")
+
+        # Open the archive and extract entries safely (no extractall / zip-slip)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            extracted, skipped = _safe_extract_all(zf, extract_dir)
+
+        # Build summary listing every extracted entry
+        summary = [f"Extracted {len(extracted)} entries to '{extract_dir}':"]
+        for name in extracted:
+            summary.append(f"  - {name}")
+
+        # Surface any rejected unsafe entries so the Agent knows they were skipped
+        if skipped:
+            summary.append(f"\n⚠️ Skipped {len(skipped)} unsafe entries (path traversal):")
+            for name in skipped:
+                summary.append(f"  - {name}")
+
+        # Return listing capped at 20,000 characters
+        return "\n".join(summary)[:20000]
+    except Exception as e:
+        # Return error message if .zip extraction fails
+        return f"Error extracting .zip: {e}"
+
+# ─── Main Agent Class ──────────────────────────────────────────────
+class _RetryingOpenAIServerModel(OpenAIServerModel):
+    """OpenAIServerModel that retries transient model/network errors with backoff.
+
+    smolagents already retries rate-limit errors internally; this wrapper adds
+    retries for connection/timeout/5xx failures so a transient network blip
+    cannot fail a Task. The Agent's step memory is preserved across retries
+    (unlike retrying the whole ``agent.run``), so no tool side-effects repeat.
+    """
+
+    def generate(self, messages, **kwargs):
+        return _call_with_retry(
+            lambda: super().generate(messages, **kwargs),
+            description="model call",
+        )
+
+class GAIASolverAgent:
+    def __init__(self):
+        # Validate that DEEPSEEK_API_KEY is available before proceeding
+        if not DEEPSEEK_API_KEY:
+            raise ValueError("⚠️ The environment variable 'DEEPSEEK_API_KEY' is not configured.")
+
+        # Initialize retrying model pointing to configured API base and model
+        self.main_model = _RetryingOpenAIServerModel(
+            model_id=AGENT_MODEL,
+            api_base=DEEPSEEK_API_BASE,
+            api_key=DEEPSEEK_API_KEY,
+        )
+
+        # Instantiate CodeAgent from smolagents framework
+        self.agent = CodeAgent(
+            tools=[
+                DuckDuckGoSearchTool(), # Web search tool
+                VisitWebpageTool(),     # Web scraping/browsing tool
+                transcribe_audio,       # Audio transcription tool
+                get_youtube_transcript, # YouTube transcript extraction tool
+                inspect_pdf,            # PDF text extraction tool
+                inspect_excel,          # Excel sheet inspector tool
+                read_file_as_text,      # General text/CSV/JSON reader tool
+                inspect_docx,           # Word .docx text extraction tool
+                inspect_pptx,           # PowerPoint .pptx text extraction tool
+                extract_zip,            # Zip archive extraction tool
+                inspect_image,          # Image vision tool (Qwen2-VL-2B + OCR)
+            ],
+            model=self.main_model,
+            # Explicit Python module imports authorized for code-execution agent actions
+            additional_authorized_imports=[
+                # ── Standard Python Libraries ──
+                "sys", "os", "pathlib", "glob", "shutil", "tempfile", 
+                "hashlib", "base64", "math", "statistics", "random", 
+                "re", "string", "datetime", "time", "json", "csv", 
+                "xml", "html", "urllib", "urllib.parse", "io", "copy", 
+                "collections", "itertools", "functools", "operator", 
+                "typing", "dataclasses", "unicodedata", "wave", "zipfile", 
+                "tarfile", "sqlite3", "uuid", "ast", "inspect",
+
+                # ── Data Science & Math ──
+                "numpy", "pandas", "scipy", "scipy.stats", "scipy.optimize",
+                "matplotlib", "matplotlib.pyplot", "seaborn", "sympy", 
+                "sklearn", "stat",
+
+                # ── File & Image Processing ──
+                "PIL", "PIL.Image", "PIL.ImageDraw", "cv2", 
+                "openpyxl", "xlrd", "pdfplumber", "PyPDF2", "pypdf", 
+                "fitz", "docx", "pptx",
+
+                # ── Web, Scraping & Networking ──
+                "requests", "bs4", "lxml", "queue"
+            ],
+            # Set upper limit on agent reasoning steps per task execution run
+            max_steps=25,
+        )
+
+    def _clean_answer(self, question: str, raw_answer: str) -> str:
+        """Uses the DeepSeek model to structure the clean final answer synchronously per thread."""
+        try:
+            # Import OpenAI client module inside method scope
+            import openai
+            
+            # Instantiate OpenAI client with DeepSeek credentials
+            client = openai.OpenAI(
+                base_url=DEEPSEEK_API_BASE,
+                api_key=DEEPSEEK_API_KEY,
+            )
+            
+            # Build the cleaning prompt via replacement interpolation (safe for
+            # Answers/Questions containing braces) and raise the token budget so
+            # long comma-separated list Answers are not truncated
+            prompt = _build_cleaning_prompt(question, raw_answer)
+
+            # Request completion call to format output cleanly according to rules,
+            # retrying transient model/network failures with backoff
+            def _request():
+                return client.chat.completions.create(
+                    model=CLEANING_MODEL,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=CLEANING_MAX_TOKENS,
+                    temperature=0.0, # Deterministic zero-temperature for consistent answers
+                )
+
+            completion = _call_with_retry(_request, description="answer cleaning")
+            
+            # Extract response text content from LLM choice completion
+            text = completion.choices[0].message.content
+            text = "" if text is None else str(text).strip()
+
+            # Remove internal reasoning <think> blocks if present in output
+            text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+            
+            # Strip prefixes, formatting marks, and code blocks from cleaned output
+            for prefix in [*ANSWER_PREFIXES, "**", "```"]:
+                if text.startswith(prefix):
+                    text = text[len(prefix):].strip()
+                    
+            # Return cleaned string without trailing formatting chars
+            return text.rstrip("*`")
+        except Exception as e:
+            # Fallback to standard normalization regex if API formatting call fails
+            return _normalize_answer_for_submission(raw_answer)
+
+    def __call__(self, task_id: str, question: str, file_name: str) -> str:
+        try:
+            # Locate file locally instead of downloading from remote server
+            file_path = _get_local_task_file(task_id, file_name)
+
+            # Construct agent task prompt
+            prompt = f"TASK: {question}\n\n"
+
+            prompt += "### FORMATTING RULES:\n"
+            prompt += "- If you need to write or run Python code, you MUST wrap the code block strictly inside <code>\n[your python code]\n</code> tags.\n"
+            prompt += "- Ensure there is a newline after the opening tag and before the closing tag.\n\n"
+
+            
+            if file_path:
+                ext = file_path.lower().split('.')[-1]
+                if ext in ('png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'):
+                    prompt += f"🖼️ IMAGE saved at '{file_path}'. Use 'inspect_image' with the task question to extract its content.\n\n"
+                elif ext in ('mp3', 'wav', 'm4a', 'ogg', 'flac'):
+                    prompt += f"🎙️ AUDIO saved at '{file_path}'. Use 'transcribe_audio'.\n\n"
+                elif ext in ('pdf',):
+                    prompt += f"📄 PDF saved at '{file_path}'. Use 'inspect_pdf' or Python libraries like pdfplumber/fitz.\n\n"
+                elif ext in ('xlsx', 'xls'):
+                    prompt += f"📊 EXCEL saved at '{file_path}'. Use 'inspect_excel' or Python pandas.\n\n"
+                elif ext in ('docx',):
+                    prompt += f"📝 WORD saved at '{file_path}'. Use 'inspect_docx' to extract text and tables.\n\n"
+                elif ext in ('pptx',):
+                    prompt += f"📽️ POWERPOINT saved at '{file_path}'. Use 'inspect_pptx' to extract slide text.\n\n"
+                elif ext in ('zip',):
+                    prompt += f"🗜️ ZIP ARCHIVE saved at '{file_path}'. Use 'extract_zip' to list and extract its contents.\n\n"
+                else:
+                    prompt += f"📎 FILE saved at '{file_path}'. Use 'read_file_as_text' or open with Python.\n\n"
+            elif file_name and str(file_name).strip():
+                prompt += f"⚠️ Note: Attachment '{file_name}' was specified but not found locally in files directory.\n\n"
+
+            if "youtube.com" in question.lower() or "youtu.be" in question.lower():
+                prompt += "📹 YOUTUBE: Use 'get_youtube_transcript' to process the link.\n\n"
+
+            prompt += "CRITICAL INSTRUCTIONS:\n1. Answer concisely.\n2. Provide the exact data required.\n"
+
+            # Run agent loop (text-only; image attachments are handled via the
+            # 'inspect_image' tool). Transient model/network failures are retried
+            # inside _RetryingOpenAIServerModel.generate, which preserves the
+            # Agent's step memory (retrying the whole loop would repeat tool
+            # side-effects)
+            raw_answer = self.agent.run(prompt)
+            raw_answer_str = str(raw_answer).strip()
+            raw_answer_str = re.sub(r'<think>.*?</think>', '', raw_answer_str, flags=re.DOTALL).strip()
+
+            final_answer = _normalize_answer_for_submission(
+                self._clean_answer(question, raw_answer_str)
+            )
+            return final_answer
+        except Exception as e:
+            return f"Error: {e}"
+
+# ─── Asynchronous Threaded Console Script Execution ──────────────────────
+def run_pipeline_and_save_csv():
+    """Fetches questions, processes them in parallel across agent pool, and outputs gaia_results.csv."""
+    print("Base: Connecting to the GAIA server to fetch questions...")
+    try:
+        # Send HTTP GET request to download questions dataset JSON from server,
+        # retrying transient network failures with backoff
+        def _fetch_questions():
+            response = requests.get(f"{DEFAULT_API_URL}/questions", timeout=15)
+            response.raise_for_status()
+            return response.json()
+
+        questions_data = _call_with_retry(_fetch_questions, description="questions fetch")
+        
+        # If question list is empty, exit pipeline
+        if not questions_data:
+            print("⚠️ No questions were retrieved from the server.")
+            return
+    except Exception as e:
+        # Print error message and cancel run if question retrieval fails
+        print(f"❌ Error downloading the questions dataset: {e}")
+        return
+
+    # Worker thread count comes from module-level configuration (GAIA_NUM_WORKERS)
+    total = len(questions_data)
+    print(f"📋 {total} questions loaded. Initializing {NUM_WORKERS} independent agents (DeepSeek)...")
+    
+    try:
+        # Create pool of GAIASolverAgent instances (1 per worker thread)
+        agents = [GAIASolverAgent() for _ in range(NUM_WORKERS)]
+    except Exception as e:
+        print(f"❌ Error creating the agent pool: {e}")
+        return
+
+    # Create thread-safe queue to manage available GAIASolverAgent instances across threads
+    agent_queue = queue.Queue()
+    for a in agents:
+        agent_queue.put(a) # Put each worker agent into queue
+
+    def _make_result(idx, task, answer, elapsed):
+        """Builds a structured result record for a Task."""
+        return {
+            "index": idx + 1,
+            "task_id": task.get("task_id", "???"),
+            "level": task.get("Level", "?"),
+            "file_name": task.get("file_name", "") or "None",
+            "question": task.get("question", ""),
+            "answer": answer,
+            "execution_time_sec": round(elapsed, 2),
+        }
+
+    def _resolve(idx, task):
+        """Worker thread task execution wrapper."""
+        # Pop an available agent instance from queue (blocking if all are busy)
+        my_agent = agent_queue.get()
+        t0 = time.time()
+        replaced = False
+        try:
+            # Run the Agent on the Task, bounded by TASK_TIMEOUT_SEC so a stuck
+            # call cannot block this worker (or the whole Run) indefinitely
+            answer = _run_with_timeout(
+                lambda: my_agent(
+                    task.get("task_id", "???"),
+                    task.get("question", ""),
+                    task.get("file_name", ""),
+                ),
+                TASK_TIMEOUT_SEC,
+            )
+            return _make_result(idx, task, answer, time.time() - t0)
+        except TimeoutError:
+            # The Agent may still be wedged in a hung call on a daemon helper
+            # thread. Never reuse a possibly-corrupted Agent: drop it and put a
+            # fresh one in its place so the pool stays at full strength
+            replaced = True
+            try:
+                agent_queue.put(GAIASolverAgent())
+            except Exception as e:
+                print(f"⚠️ Could not replace a timed-out Agent: {e}")
+            return _make_result(
+                idx, task,
+                f"Error: Task timed out after {TASK_TIMEOUT_SEC:.0f}s",
+                time.time() - t0,
+            )
+        except Exception as e:
+            # A throwing Task must not lose the worker: record an error Answer
+            # for this Task so the Run still completes for every Task
+            return _make_result(idx, task, f"Error: {e}", time.time() - t0)
+        finally:
+            # Always return the Agent to the pool (unless it was replaced above)
+            # so no worker is ever lost and the queue can never deadlock, even
+            # when a Task throws
+            if not replaced:
+                agent_queue.put(my_agent)
+
+    # List container for completed task output results
+    completed_results = []
+    print(f"\n🚀 Processing tasks asynchronously in parallel...")
+
+    # Initialize ThreadPoolExecutor with maximum configured thread workers
+    executor = ThreadPoolExecutor(max_workers=NUM_WORKERS)
+    # Submit all tasks to thread executor pool, mapping each future to its (idx, task)
+    futures = {
+        executor.submit(_resolve, i, task): (i, task)
+        for i, task in enumerate(questions_data)
+        if task.get("task_id")
+    }
+    total_tasks = len(futures)
+
+    completed = 0
+    try:
+        # Consume results in submission order. Each worker enforces its own
+        # TASK_TIMEOUT_SEC internally, so every future resolves in bounded time
+        for future, (i, task) in futures.items():
+            try:
+                res = future.result()
+            except Exception as e:
+                # Unexpected executor-level failure (worker already handles
+                # Task-level errors); still record an Answer for every Task
+                res = _make_result(i, task, f"Error: {e}", 0.0)
+            completed += 1
+            completed_results.append(res)  # Store result record
+
+            # Print live task progress log to stdout
+            print(f"✅ [{completed}/{total_tasks}] Task #{res['index']} completed in {res['execution_time_sec']}s | Answer: {res['answer']}")
+    finally:
+        # Worker threads finish their current Task within TASK_TIMEOUT_SEC, so
+        # shutdown(wait=True) completes promptly; wedged daemon helper threads
+        # cannot block the process at exit
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    # Re-sort results list by original dataset question index ordering
+    completed_results = sorted(completed_results, key=lambda x: x["index"])
+    
+    # Convert list of result dictionaries into Pandas DataFrame
+    df_output = pd.DataFrame(completed_results)
+    
+    # Define destination CSV filename
+    output_filename = "gaia_results.csv"
+    
+    # Export DataFrame to local CSV file without index column
+    df_output.to_csv(output_filename, index=False, encoding="utf-8")
+    
+    # Print completion summary message and target output path
+    print(f"\n{'═'*50}")
+    print(f"📊 PROCESS COMPLETED SUCCESSFULLY")
+    print(f"💾 Asynchronous results have been saved to: {os.path.abspath(output_filename)}")
+    print(f"{'═'*50}\n")
+
+# Python script entry point check
+if __name__ == "__main__":
+    # Execute full pipeline when script is run directly from command line
+    run_pipeline_and_save_csv()

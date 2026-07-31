@@ -1,0 +1,21 @@
+# Secrets — never commit API keys
+.env
+.env.*
+
+# Pre-downloaded benchmark Attachments (large; fetched by the server / local Run)
+files/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Run outputs (regenerated each Run; the Answer bundle is committed instead)
+gaia_results.csv
+
+# OS / editor
+.DS_Store
+.vscode/
