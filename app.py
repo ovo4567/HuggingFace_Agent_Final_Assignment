@@ -1,25 +1,12 @@
 import os
 import gradio as gr
-import pandas as pd
 
 import text
 import orchestration
+import results_view
 
 # --- Constants ---
 DEFAULT_API_URL = os.getenv("GAIA_API_URL", "https://agents-course-unit4-scoring.hf.space")
-
-
-def _results_dataframe(view):
-    """Builds the display DataFrame from the results-view rows.
-
-    The Worklog column is excluded here — it is a structured dict that the
-    expandable per-Task Worklog view renders (ticket 05).
-    """
-    columns = [
-        "task_id", "level", "file_name", "question", "answer",
-        "source", "status", "timestamp",
-    ]
-    return pd.DataFrame([{c: r.get(c) for c in columns} for r in view["rows"]])
 
 
 def run_and_submit_all(profile: gr.OAuthProfile | None):
@@ -29,6 +16,11 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
     (best-effort, text/web-only) for Tasks missing from the bundle — downloading
     their Attachments from the server first — posts the submission payload, and
     returns the Benchmark results.
+
+    Returns ``(status_message, results_html)``: the first element is a concise
+    run/submission status; the second is the rendered Benchmark results view
+    (score card + per-Question table + expandable per-Task Worklog — ticket 05)
+    as an HTML fragment for a ``gr.HTML`` component.
     """
     # --- Determine HF Space Repo URL ---
     space_id = os.getenv("SPACE_ID")
@@ -109,11 +101,12 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
         score_response = server.submit(payload)
     except Exception as e:
         print(f"Submission failed: {e}")
-        return f"Submission Failed: {e}", _results_dataframe(view)
+        return f"Submission Failed: {e}", results_view.render_results_view(view)
 
     view["score_card"].update(orchestration.parse_score_response(score_response))
 
-    # 6. Build the status message (score card) + results table
+    # 6. Build the concise status message + the rich results view (score card,
+    # per-Question table, expandable per-Task Worklog — ticket 05).
     sc = view["score_card"]
     score = sc.get("score")
     score_display = "N/A" if score is None else f"{score}%"
@@ -131,7 +124,7 @@ def run_and_submit_all(profile: gr.OAuthProfile | None):
     if submitted_at:
         final_status += f"\nSubmitted at: {submitted_at}"
     print("Submission successful.")
-    return final_status, _results_dataframe(view)
+    return final_status, results_view.render_results_view(view)
 
 
 # --- Build Gradio Interface using Blocks ---
@@ -158,12 +151,14 @@ with gr.Blocks() as demo:
     run_button = gr.Button("Run Evaluation & Submit All Answers")
 
     status_output = gr.Textbox(label="Run Status / Submission Result", lines=5, interactive=False)
-    # Removed max_rows=10 from DataFrame constructor
-    results_table = gr.DataFrame(label="Questions and Agent Answers", wrap=True)
+    # Ticket 05: the rich Benchmark results view — score card, per-Question
+    # table of submitted Answers (Level + source), and an expandable per-Task
+    # Worklog (tool summary + full trace) — rendered as one HTML fragment.
+    results_output = gr.HTML(label="Benchmark Results")
 
     run_button.click(
         fn=run_and_submit_all,
-        outputs=[status_output, results_table]
+        outputs=[status_output, results_output]
     )
 
 if __name__ == "__main__":
