@@ -753,3 +753,96 @@ class TestSolveWorklogOnError:
         assert worklog["error"] == "model exploded"
         assert len(worklog["steps"]) == 1
         assert worklog["steps"][0]["thought"] == "partial thought"
+
+
+# ─── Agent toolset: text/web-only Space fallback (ticket 04, ADR-0002) ──
+class TestGAIASolverAgentToolset:
+    def _build(self, monkeypatch, multimodal):
+        captured = {}
+
+        class _FakeCodeAgent:
+            def __init__(self, **kwargs):
+                captured["tools"] = kwargs["tools"]
+
+        monkeypatch.setattr(text, "DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setattr(text, "CodeAgent", _FakeCodeAgent)
+
+        text.GAIASolverAgent(multimodal=multimodal)
+        return {t.name for t in captured["tools"]}
+
+    def test_full_toolset_includes_multimodal_tools(self, monkeypatch):
+        names = self._build(monkeypatch, multimodal=True)
+        assert {"inspect_image", "transcribe_audio", "extract_video_frames"} <= names
+        assert {"web_search", "get_youtube_transcript", "inspect_pdf"} <= names
+
+    def test_text_only_toolset_excludes_multimodal_tools(self, monkeypatch):
+        # ADR-0002: the live-on-Space fallback is text/web-only (no local vision
+        # or audio models), so those tools must not be registered.
+        names = self._build(monkeypatch, multimodal=False)
+        assert "inspect_image" not in names
+        assert "transcribe_audio" not in names
+        assert "extract_video_frames" not in names
+        # Web + document tools stay available
+        assert {"web_search", "get_youtube_transcript", "inspect_pdf",
+                "inspect_excel", "read_file_as_text", "inspect_docx",
+                "inspect_pptx", "extract_zip"} <= names
+
+
+# ─── solve() explicit file_path (ticket 04) ────────────────────────────
+class TestSolveExplicitFilePath:
+    def _make_solver(self):
+        class _FakeMemory:
+            def __init__(self):
+                self.steps = []
+
+            def reset(self):
+                self.steps = []
+
+        class _FakeAgent:
+            def __init__(self):
+                self.memory = _FakeMemory()
+                self.prompt = None
+
+            def run(self, prompt):
+                self.prompt = prompt
+                return "42"
+
+        solver = object.__new__(text.GAIASolverAgent)
+        solver.agent = _FakeAgent()
+        solver._clean_answer = lambda q, a: a  # skip the LLM cleaning call
+        return solver
+
+    def test_explicit_file_path_skips_local_lookup(self, monkeypatch):
+        solver = self._make_solver()
+
+        seen = {"called": False}
+
+        def fake_lookup(task_id, file_name):
+            seen["called"] = True
+            return "/local/path"
+
+        monkeypatch.setattr(text, "_get_local_task_file", fake_lookup)
+
+        answer, worklog = solver.solve("t1", "Q?", "doc.pdf",
+                                       file_path="/downloaded/t1.pdf")
+
+        assert answer == "42"
+        assert seen["called"] is False  # explicit path wins over local lookup
+        assert "/downloaded/t1.pdf" in solver.agent.prompt
+        assert worklog["status"] == "completed"
+
+    def test_missing_file_path_uses_local_lookup(self, monkeypatch):
+        solver = self._make_solver()
+
+        seen = {"path": ""}
+
+        def fake_lookup(task_id, file_name):
+            seen["path"] = "/local/report.pdf"
+            return "/local/report.pdf"
+
+        monkeypatch.setattr(text, "_get_local_task_file", fake_lookup)
+
+        solver.solve("t1", "Q?", "report.pdf")
+
+        assert seen["path"] == "/local/report.pdf"
+        assert "/local/report.pdf" in solver.agent.prompt

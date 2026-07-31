@@ -1,163 +1,155 @@
 import os
 import gradio as gr
-import requests
-import inspect
 import pandas as pd
-import spaces
 
-# (Keep Constants as is)
+import text
+import orchestration
+
 # --- Constants ---
-DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
+DEFAULT_API_URL = os.getenv("GAIA_API_URL", "https://agents-course-unit4-scoring.hf.space")
 
-# --- Basic Agent Definition ---
-# ----- THIS IS WERE YOU CAN BUILD WHAT YOU WANT ------
-class BasicAgent:
-    def __init__(self):
-        print("BasicAgent initialized.")
 
-    @spaces.GPU
-    def __call__(self, question: str) -> str:
-        print(f"Agent received question (first 50 chars): {question[:50]}...")
-        fixed_answer = "This is a default answer."
-        print(f"Agent returning fixed answer: {fixed_answer}")
-        return fixed_answer
+def _results_dataframe(view):
+    """Builds the display DataFrame from the results-view rows.
 
-def run_and_submit_all( profile: gr.OAuthProfile | None):
+    The Worklog column is excluded here — it is a structured dict that the
+    expandable per-Task Worklog view renders (ticket 05).
     """
-    Fetches all questions, runs the BasicAgent on them, submits all answers,
-    and displays the results.
+    columns = [
+        "task_id", "level", "file_name", "question", "answer",
+        "source", "status", "timestamp",
+    ]
+    return pd.DataFrame([{c: r.get(c) for c in columns} for r in view["rows"]])
+
+
+def run_and_submit_all(profile: gr.OAuthProfile | None):
     """
-    # --- Determine HF Space Runtime URL and Repo URL ---
-    space_id = os.getenv("SPACE_ID") # Get the SPACE_ID for sending link to the code
+    Fetches the served Questions, submits the committed Answer bundle for every
+    Task it recognizes (without calling the Agent), runs the live Agent
+    (best-effort, text/web-only) for Tasks missing from the bundle — downloading
+    their Attachments from the server first — posts the submission payload, and
+    returns the Benchmark results.
+    """
+    # --- Determine HF Space Repo URL ---
+    space_id = os.getenv("SPACE_ID")
 
     if profile:
-        username= f"{profile.username}"
+        username = f"{profile.username}"
         print(f"User logged in: {username}")
     else:
         print("User not logged in.")
         return "Please Login to Hugging Face with the button.", None
 
-    api_url = DEFAULT_API_URL
-    questions_url = f"{api_url}/questions"
-    submit_url = f"{api_url}/submit"
-
-    # 1. Instantiate Agent ( modify this part to create your agent)
-    try:
-        agent = BasicAgent()
-    except Exception as e:
-        print(f"Error instantiating agent: {e}")
-        return f"Error initializing agent: {e}", None
-    # In the case of an app running as a hugging Face space, this link points toward your codebase ( usefull for others so please keep it public)
-    agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main"
+    # In the case of an app running as a Hugging Face space, this link points
+    # toward your codebase (useful for others so please keep it public)
+    agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main" if space_id else ""
     print(agent_code)
 
-    # 2. Fetch Questions
-    print(f"Fetching questions from: {questions_url}")
+    # Thin client for the scoring server (fetch /questions, download /files/{id},
+    # POST /submit)
+    server = orchestration.ServerAPI(DEFAULT_API_URL)
+
+    # 1. Fetch Questions
+    print(f"Fetching questions from: {DEFAULT_API_URL}/questions")
     try:
-        response = requests.get(questions_url, timeout=15)
-        response.raise_for_status()
-        questions_data = response.json()
-        if not questions_data:
-             print("Fetched questions list is empty.")
-             return "Fetched questions list is empty or invalid format.", None
-        print(f"Fetched {len(questions_data)} questions.")
-    except requests.exceptions.RequestException as e:
+        questions = server.fetch_questions()
+        if not questions:
+            print("Fetched questions list is empty.")
+            return "Fetched questions list is empty or invalid format.", None
+        print(f"Fetched {len(questions)} questions.")
+    except Exception as e:
         print(f"Error fetching questions: {e}")
         return f"Error fetching questions: {e}", None
-    except requests.exceptions.JSONDecodeError as e:
-         print(f"Error decoding JSON response from questions endpoint: {e}")
-         print(f"Response text: {response.text[:500]}")
-         return f"Error decoding server response for questions: {e}", None
-    except Exception as e:
-        print(f"An unexpected error occurred fetching questions: {e}")
-        return f"An unexpected error occurred fetching questions: {e}", None
 
-    # 3. Run your Agent
-    results_log = []
-    answers_payload = []
-    print(f"Running agent on {len(questions_data)} questions...")
-    for item in questions_data:
-        task_id = item.get("task_id")
-        question_text = item.get("question")
-        if not task_id or question_text is None:
-            print(f"Skipping item with missing task_id or question: {item}")
-            continue
+    # 2. Load the committed Answer bundle (generated by local Runs, keyed by
+    # task_id). Bundled Answers are submitted without re-solving (ADR-0001).
+    bundle = text._load_answer_bundle()
+    print(f"Answer bundle holds {len(bundle)} Task(s).")
+
+    # 3. Build the live Agent lazily — only needed when Tasks are missing from
+    # the bundle, so a fully-bundled Run needs no DEEPSEEK_API_KEY. The Space
+    # fallback is text/web-only (ADR-0002): no local vision/audio models load.
+    unbundled = [
+        t for t in questions
+        if t.get("task_id") and t.get("task_id") not in bundle
+    ]
+    agent = None
+    if unbundled:
         try:
-            submitted_answer = agent(question_text)
-            answers_payload.append({"task_id": task_id, "submitted_answer": submitted_answer})
-            results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": submitted_answer})
+            agent = text.GAIASolverAgent(multimodal=False)
+            print(f"Built live Agent for {len(unbundled)} unbundled Task(s).")
         except Exception as e:
-             print(f"Error running agent on task {task_id}: {e}")
-             results_log.append({"Task ID": task_id, "Question": question_text, "Submitted Answer": f"AGENT ERROR: {e}"})
+            print(f"⚠️ Could not build the live Agent (best-effort): {e}")
 
-    if not answers_payload:
-        print("Agent did not produce any answers to submit.")
-        return "Agent did not produce any answers to submit.", pd.DataFrame(results_log)
-
-    # 4. Prepare Submission 
-    submission_data = {"username": username.strip(), "agent_code": agent_code, "answers": answers_payload}
-    status_update = f"Agent finished. Submitting {len(answers_payload)} answers for user '{username}'..."
-    print(status_update)
-
-    # 5. Submit
-    print(f"Submitting {len(answers_payload)} answers to: {submit_url}")
+    # 4. Orchestrate: build the submission payload + results view (bundle match
+    # → bundled Answer/Worklog; unbundled → live solve, downloading the
+    # Attachment from the server first)
     try:
-        response = requests.post(submit_url, json=submission_data, timeout=60)
-        response.raise_for_status()
-        result_data = response.json()
-        final_status = (
-            f"Submission Successful!\n"
-            f"User: {result_data.get('username')}\n"
-            f"Overall Score: {result_data.get('score', 'N/A')}% "
-            f"({result_data.get('correct_count', '?')}/{result_data.get('total_attempted', '?')} correct)\n"
-            f"Message: {result_data.get('message', 'No message received.')}"
+        payload, view = orchestration.orchestrate_run(
+            questions, bundle, agent, server,
+            username=username, agent_code=agent_code,
         )
-        print("Submission successful.")
-        results_df = pd.DataFrame(results_log)
-        return final_status, results_df
-    except requests.exceptions.HTTPError as e:
-        error_detail = f"Server responded with status {e.response.status_code}."
-        try:
-            error_json = e.response.json()
-            error_detail += f" Detail: {error_json.get('detail', e.response.text)}"
-        except requests.exceptions.JSONDecodeError:
-            error_detail += f" Response: {e.response.text[:500]}"
-        status_message = f"Submission Failed: {error_detail}"
-        print(status_message)
-        results_df = pd.DataFrame(results_log)
-        return status_message, results_df
-    except requests.exceptions.Timeout:
-        status_message = "Submission Failed: The request timed out."
-        print(status_message)
-        results_df = pd.DataFrame(results_log)
-        return status_message, results_df
-    except requests.exceptions.RequestException as e:
-        status_message = f"Submission Failed: Network error - {e}"
-        print(status_message)
-        results_df = pd.DataFrame(results_log)
-        return status_message, results_df
     except Exception as e:
-        status_message = f"An unexpected error occurred during submission: {e}"
-        print(status_message)
-        results_df = pd.DataFrame(results_log)
-        return status_message, results_df
+        print(f"Error orchestrating the run: {e}")
+        return f"Error orchestrating the run: {e}", None
+
+    if not payload["answers"]:
+        print("No answers to submit.")
+        return "No answers to submit.", None
+
+    # 5. Submit the payload and capture the Benchmark results (ScoreResponse)
+    bundled_count = sum(1 for r in view["rows"] if r["source"] == "bundle")
+    live_count = sum(1 for r in view["rows"] if r["source"] == "live")
+    status_update = (
+        f"Submitting {len(payload['answers'])} answers for user '{username}' "
+        f"({bundled_count} from bundle, {live_count} live)..."
+    )
+    print(status_update)
+    try:
+        score_response = server.submit(payload)
+    except Exception as e:
+        print(f"Submission failed: {e}")
+        return f"Submission Failed: {e}", _results_dataframe(view)
+
+    view["score_card"].update(orchestration.parse_score_response(score_response))
+
+    # 6. Build the status message (score card) + results table
+    sc = view["score_card"]
+    score = sc.get("score")
+    score_display = "N/A" if score is None else f"{score}%"
+    correct = sc.get("correct_count")
+    total = sc.get("total_attempted")
+    correct_display = "?" if correct is None else correct
+    total_display = "?" if total is None else total
+    final_status = (
+        "Submission Successful!\n"
+        f"User: {sc.get('username')}\n"
+        f"Overall Score: {score_display} ({correct_display}/{total_display} correct)\n"
+        f"Message: {sc.get('message', 'No message received.')}"
+    )
+    submitted_at = sc.get("timestamp")
+    if submitted_at:
+        final_status += f"\nSubmitted at: {submitted_at}"
+    print("Submission successful.")
+    return final_status, _results_dataframe(view)
 
 
 # --- Build Gradio Interface using Blocks ---
 with gr.Blocks() as demo:
-    gr.Markdown("# Basic Agent Evaluation Runner")
+    gr.Markdown("# GAIA Solver Evaluation Runner")
     gr.Markdown(
         """
         **Instructions:**
 
-        1.  Please clone this space, then modify the code to define your agent's logic, the tools, the necessary packages, etc ...
-        2.  Log in to your Hugging Face account using the button below. This uses your HF username for submission.
-        3.  Click 'Run Evaluation & Submit All Answers' to fetch questions, run your agent, submit answers, and see the score.
+        1.  Log in to your Hugging Face account using the button below. This uses your HF username for submission.
+        2.  Click 'Run Evaluation & Submit All Answers' to submit the pre-computed Answer bundle, run the Agent live (best-effort) for any Questions missing from it, and see the Benchmark results.
 
         ---
-        **Disclaimers:**
-        Once clicking on the "submit button, it can take quite some time ( this is the time for the agent to go through all the questions).
-        This space provides a basic setup and is intentionally sub-optimal to encourage you to develop your own, more robust solution. For instance for the delay process of the submit button, a solution could be to cache the answers and submit in a seperate action or even to answer the questions in async.
+        **How it works:**
+        Answers are pre-computed locally (see `text.py`) into a committed Answer
+        bundle (`answer_bundle.json`). This Space submits those answers directly
+        for every Question it recognizes — no re-solving — and only runs the live
+        Agent (text/web-only) for Questions missing from the bundle.
         """
     )
 
@@ -195,5 +187,5 @@ if __name__ == "__main__":
 
     print("-"*(60 + len(" App Starting ")) + "\n")
 
-    print("Launching Gradio Interface for Basic Agent Evaluation...")
+    print("Launching Gradio Interface for GAIA Solver Evaluation...")
     demo.launch(debug=True, share=False)

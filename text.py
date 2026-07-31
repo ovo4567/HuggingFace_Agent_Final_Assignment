@@ -1318,7 +1318,18 @@ class _RetryingOpenAIServerModel(OpenAIServerModel):
         )
 
 class GAIASolverAgent:
-    def __init__(self):
+    def __init__(self, *, multimodal: bool = True):
+        """Builds the ReAct solver Agent.
+
+        Args:
+            multimodal: When True (default, local harness), the full toolset is
+                registered, including the local vision model (inspect_image),
+                local audio transcription (transcribe_audio), and video frame
+                sampling (extract_video_frames). When False (live-on-Space
+                fallback), only text/web + document tools are registered, so no
+                heavy local model is ever loaded — per ADR-0002 the Space
+                fallback is text/web-only (no GPU, no hosted key).
+        """
         # Validate that DEEPSEEK_API_KEY is available before proceeding
         if not DEEPSEEK_API_KEY:
             raise ValueError("⚠️ The environment variable 'DEEPSEEK_API_KEY' is not configured.")
@@ -1330,22 +1341,31 @@ class GAIASolverAgent:
             api_key=DEEPSEEK_API_KEY,
         )
 
+        # Text/web-only base + document tools, present in both modes
+        tools = [
+            DuckDuckGoSearchTool(), # Web search tool
+            VisitWebpageTool(),     # Web scraping/browsing tool
+            get_youtube_transcript, # YouTube transcript extraction tool (spoken content)
+            inspect_pdf,            # PDF text extraction tool
+            inspect_excel,          # Excel sheet inspector tool
+            read_file_as_text,      # General text/CSV/JSON reader tool
+            inspect_docx,           # Word .docx text extraction tool
+            inspect_pptx,           # PowerPoint .pptx text extraction tool
+            extract_zip,            # Zip archive extraction tool
+        ]
+        if multimodal:
+            # Local-model tools (ADR-0002): vision, audio, and video frames.
+            # Excluded from the Space fallback so Qwen2-VL / faster-whisper are
+            # never loaded on the constrained free Space.
+            tools += [
+                transcribe_audio,       # Audio transcription tool (local faster-whisper)
+                extract_video_frames,   # Video frame-sampling tool (visual content)
+                inspect_image,          # Image vision tool (Qwen2-VL-2B + OCR)
+            ]
+
         # Instantiate CodeAgent from smolagents framework
         self.agent = CodeAgent(
-            tools=[
-                DuckDuckGoSearchTool(), # Web search tool
-                VisitWebpageTool(),     # Web scraping/browsing tool
-                transcribe_audio,       # Audio transcription tool (local faster-whisper)
-                get_youtube_transcript, # YouTube transcript extraction tool (spoken content)
-                extract_video_frames,   # Video frame-sampling tool (visual content)
-                inspect_pdf,            # PDF text extraction tool
-                inspect_excel,          # Excel sheet inspector tool
-                read_file_as_text,      # General text/CSV/JSON reader tool
-                inspect_docx,           # Word .docx text extraction tool
-                inspect_pptx,           # PowerPoint .pptx text extraction tool
-                extract_zip,            # Zip archive extraction tool
-                inspect_image,          # Image vision tool (Qwen2-VL-2B + OCR)
-            ],
+            tools=tools,
             model=self.main_model,
             # Explicit Python module imports authorized for code-execution agent actions
             additional_authorized_imports=[
@@ -1426,7 +1446,8 @@ class GAIASolverAgent:
         """Solves a Task and returns just the final Answer (see ``solve``)."""
         return self.solve(task_id, question, file_name)[0]
 
-    def solve(self, task_id: str, question: str, file_name: str) -> tuple[str, dict]:
+    def solve(self, task_id: str, question: str, file_name: str,
+              file_path: str | None = None) -> tuple[str, dict]:
         """Solves a Task and returns ``(final_answer, worklog)``.
 
         ``worklog`` is the structured serialization of this Agent's recorded
@@ -1435,6 +1456,11 @@ class GAIASolverAgent:
         run. On failure it returns an ``Error: ...`` Answer and an empty Worklog
         so the Run continues; the Task stays out of the Answer bundle and is
         re-solved on the next Run.
+
+        ``file_path`` is the local path to the Task's Attachment. When omitted,
+        the pre-downloaded file is located via ``_get_local_task_file`` (local
+        harness behavior); when provided (Space live fallback, where the
+        Attachment was just downloaded from the server), it is used directly.
         """
         # Ensure the Worklog only reflects THIS Task. Agent instances are reused
         # across Tasks in the worker pool, and run() resets memory only once it
@@ -1446,8 +1472,11 @@ class GAIASolverAgent:
             pass  # fresh agent: memory is already empty
 
         try:
-            # Locate file locally instead of downloading from remote server
-            file_path = _get_local_task_file(task_id, file_name)
+            # Locate the Attachment: an explicitly-provided download path (Space
+            # live fallback) wins; otherwise look for the pre-downloaded file in
+            # the local files directory (local harness)
+            if file_path is None:
+                file_path = _get_local_task_file(task_id, file_name)
 
             # Construct agent task prompt
             prompt = f"TASK: {question}\n\n"
