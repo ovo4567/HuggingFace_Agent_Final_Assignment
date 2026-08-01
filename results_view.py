@@ -40,7 +40,7 @@ _CSS = """
 .gv-badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11px;font-weight:600;color:#fff;white-space:nowrap}
 .gv-badge.gv-level1{background:#10b981}.gv-badge.gv-level2{background:#f59e0b}.gv-badge.gv-level3{background:#ef4444}
 .gv-badge.gv-source-bundle{background:#4f46e5}.gv-badge.gv-source-live{background:#0e7490}
-.gv-badge.gv-status-completed{background:#6b7280}.gv-badge.gv-status-error{background:#b91c1c}.gv-badge.gv-status-timeout{background:#b45309}
+.gv-badge.gv-status-completed{background:#6b7280}.gv-badge.gv-status-error{background:#b91c1c}.gv-badge.gv-status-timeout{background:#b45309}.gv-badge.gv-status-forced{background:#7c3aed}
 .gv-muted{color:#6b7280}.gv-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 .gv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px}
 .gv-stat{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:12px 14px}

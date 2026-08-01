@@ -124,6 +124,15 @@ class TestTable:
         html = results_view.render_results_view(_full_view(rows=[]))
         assert "No Tasks to show." in html
 
+    def test_forced_status_renders_forced_badge(self):
+        # Decision B3: a soft-deadline Task yields status "forced" — it must
+        # render a distinct status badge (gv-status-forced).
+        row = _row(source="live", status="forced", worklog=_worklog(status="forced"))
+        html = results_view.render_results_view(_full_view(rows=[row]))
+
+        assert 'class="gv-badge gv-status-forced"' in html
+        assert ">forced</span>" in html
+
 
 # ─── Expandable per-Task Worklog ───────────────────────────────────────
 class TestWorklog:

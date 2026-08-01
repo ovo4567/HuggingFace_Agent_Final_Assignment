@@ -255,6 +255,35 @@ class TestLiveFallback:
         assert rows["t2"]["source"] == "live"
         assert rows["t3"]["status"] == "error"
 
+    def test_live_forced_answer_is_submitted(self):
+        # A soft-deadline Task whose synthesized Answer carries status "forced"
+        # IS submitted and scored (decision B3) — unlike error/timeout.
+        questions = [{"task_id": "t2", "question": "Q2?", "Level": "2",
+                      "file_name": ""}]
+
+        class _ForcedAgent(_FakeAgent):
+            def solve(self, task_id, question, file_name, file_path=None):
+                self.calls.append({
+                    "task_id": task_id, "question": question,
+                    "file_name": file_name, "file_path": file_path,
+                })
+                worklog = {
+                    "steps": [], "tool_summary": [],
+                    "total_duration_sec": 0.0, "status": "forced",
+                }
+                return "forced-answer", worklog
+
+        payload, view = orchestration.orchestrate_run(
+            questions, {}, _ForcedAgent(), _FakeServer(questions),
+            username="alex", agent_code="x",
+        )
+
+        assert [a["task_id"] for a in payload["answers"]] == ["t2"]
+        assert payload["answers"][0]["submitted_answer"] == "forced-answer"
+        row = view["rows"][0]
+        assert row["status"] == "forced"
+        assert row["worklog"]["status"] == "forced"
+
 
 # ─── Submission payload contract ──────────────────────────────────────
 class TestSubmissionPayload:

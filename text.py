@@ -75,9 +75,19 @@ NUM_WORKERS = int(os.getenv("GAIA_NUM_WORKERS", "4"))
 # comma-separated list Answers are not truncated)
 CLEANING_MAX_TOKENS = int(os.getenv("CLEANING_MAX_TOKENS", "1024"))
 
-# Per-Task safety timeout in seconds: a stuck Agent/network call must not
-# block a worker (or the whole Run) indefinitely
-TASK_TIMEOUT_SEC = float(os.getenv("GAIA_TASK_TIMEOUT", "600"))
+# Two-stage per-Task timeout (Part B, decisions B1-B4): at the SOFT deadline
+# the Agent is stopped and a best-effort Answer is synthesized from its partial
+# Worklog (status "forced"); at the HARD deadline the Task is terminated and
+# recorded as "timeout". Hard is enforced as a total-time ceiling: the synthesis
+# call is clamped to the remaining hard-soft budget, so a Task ends no later
+# than ~hard seconds after it starts (a hard < soft config yields a zero
+# synthesis budget, i.e. a plain timeout).
+TASK_SOFT_TIMEOUT_SEC = float(os.getenv("GAIA_TASK_SOFT_TIMEOUT", "300"))
+TASK_HARD_TIMEOUT_SEC = float(os.getenv("GAIA_TASK_HARD_TIMEOUT", "360"))
+
+# Bounds the forced-answer synthesis call so soft + synthesis stays under the
+# hard cap (the worker also clamps it to the remaining hard-soft budget).
+FORCE_ANSWER_TIMEOUT_SEC = float(os.getenv("GAIA_FORCE_ANSWER_TIMEOUT", "45"))
 
 # Local vision model used by the 'inspect_image' tool for image attachments
 VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "Qwen/Qwen2-VL-2B-Instruct")
@@ -146,6 +156,25 @@ Final Answer: 3
 Question: {question}
 Initial Answer: {answer}
 Final Answer: """
+
+# System prompt template for the forced-answer path (Part B): when a Task hits
+# the soft deadline, a best-effort final Answer is synthesized from the Agent's
+# partial reasoning trace so something real is still submitted (status "forced").
+FORCED_ANSWER_PROMPT = """You are an expert assistant that must produce a best-effort final answer from an INCOMPLETE reasoning trace, because the agent hit its time limit.
+
+**Rules:**
+- Use ONLY evidence present in the trace; do not invent facts.
+- If the trace already contains a candidate answer or concrete data, prefer it.
+- If there is not enough evidence, give the most reasonable concise answer you can.
+- Apply the same formatting rules as a normal benchmark answer: a number and/or short text string, or a comma-separated list; no units/percentages unless specified; no extra commentary.
+
+QUESTION:
+{question}
+
+PARTIAL REASONING TRACE:
+{trace}
+
+FINAL ANSWER: """
 
 # Tuples of prefixes commonly outputted by reasoners to strip during cleanup
 ANSWER_PREFIXES = (
@@ -317,6 +346,68 @@ def _build_cleaning_prompt(question: str | None, answer: str | None) -> str:
         .replace(_PROMPT_ANSWER_SENTINEL, "" if answer is None else str(answer))
     )
     return prompt
+
+
+# Sentinels for the forced-answer prompt (Part B); same rationale as the
+# cleaning prompt: a partial trace containing "{"/"}" (code, JSON) must not
+# crash the synthesis call or double-substitute.
+_FORCE_QUESTION_SENTINEL = "\x00GAIA_FORCE_QUESTION\x00"
+_FORCE_TRACE_SENTINEL = "\x00GAIA_FORCE_TRACE\x00"
+
+
+def _build_forced_answer_prompt(question: str | None, partial_trace: str | None) -> str:
+    """Builds the forced-answer synthesis prompt.
+
+    Interpolates the Question and partial reasoning trace via string
+    replacement (never ``str.format``) so traces containing ``{``/``}`` do not
+    crash the synthesis call.
+    """
+    return (
+        FORCED_ANSWER_PROMPT
+        .replace("{question}", _FORCE_QUESTION_SENTINEL)
+        .replace("{trace}", _FORCE_TRACE_SENTINEL)
+        .replace(_FORCE_QUESTION_SENTINEL, "" if question is None else str(question))
+        .replace(_FORCE_TRACE_SENTINEL, "" if partial_trace is None else str(partial_trace))
+    )
+
+
+def _chat_answer(model_id: str, prompt: str, *, description: str,
+                 max_tokens: int | None = None) -> str:
+    """Runs a zero-temperature DeepSeek chat completion and strips it to a bare answer.
+
+    Shared by the answer-cleaning pass and the forced-answer synthesis (Part B):
+    both need the same retried, `<think>`-stripped, prefix-stripped text. Raises
+    on failure — callers decide whether to fall back (cleaning) or treat it as
+    a timeout (forced synthesis).
+    """
+    import openai
+
+    client = openai.OpenAI(base_url=DEEPSEEK_API_BASE, api_key=DEEPSEEK_API_KEY)
+
+    def _request():
+        return client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens if max_tokens is not None else CLEANING_MAX_TOKENS,
+            temperature=0.0,  # Deterministic zero-temperature for consistent answers
+        )
+
+    completion = _call_with_retry(_request, description=description)
+
+    # Extract response text content from LLM choice completion
+    text = completion.choices[0].message.content
+    text = "" if text is None else str(text).strip()
+
+    # Remove internal reasoning <think> blocks if present in output
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+
+    # Strip prefixes, formatting marks, and code blocks from the output
+    for prefix in [*ANSWER_PREFIXES, "**", "```"]:
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+
+    # Return the string without trailing formatting chars
+    return text.rstrip("*`")
 
 
 # ─── Retry-with-backoff ───────────────────────────────────────────────
@@ -588,7 +679,9 @@ def _serialize_worklog(steps, *, status: str = "completed") -> dict:
 
     The Worklog holds the full trace (thought / tool call / observation per
     step), a per-tool summary with timing, and the total Run duration for the
-    Task. ``status`` is "completed" on success or "error" on failure.
+    Task. ``status`` is "completed" on success, "forced" when the Answer was
+    synthesized from a partial trace at the soft deadline, or "error" on
+    failure.
     """
     action_steps = list(_iter_action_steps(steps))
     return {
@@ -1481,47 +1574,12 @@ class GAIASolverAgent:
     def _clean_answer(self, question: str, raw_answer: str) -> str:
         """Uses the DeepSeek model to structure the clean final answer synchronously per thread."""
         try:
-            # Import OpenAI client module inside method scope
-            import openai
-            
-            # Instantiate OpenAI client with DeepSeek credentials
-            client = openai.OpenAI(
-                base_url=DEEPSEEK_API_BASE,
-                api_key=DEEPSEEK_API_KEY,
-            )
-            
             # Build the cleaning prompt via replacement interpolation (safe for
             # Answers/Questions containing braces) and raise the token budget so
             # long comma-separated list Answers are not truncated
             prompt = _build_cleaning_prompt(question, raw_answer)
-
-            # Request completion call to format output cleanly according to rules,
-            # retrying transient model/network failures with backoff
-            def _request():
-                return client.chat.completions.create(
-                    model=CLEANING_MODEL,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=CLEANING_MAX_TOKENS,
-                    temperature=0.0, # Deterministic zero-temperature for consistent answers
-                )
-
-            completion = _call_with_retry(_request, description="answer cleaning")
-            
-            # Extract response text content from LLM choice completion
-            text = completion.choices[0].message.content
-            text = "" if text is None else str(text).strip()
-
-            # Remove internal reasoning <think> blocks if present in output
-            text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-            
-            # Strip prefixes, formatting marks, and code blocks from cleaned output
-            for prefix in [*ANSWER_PREFIXES, "**", "```"]:
-                if text.startswith(prefix):
-                    text = text[len(prefix):].strip()
-                    
-            # Return cleaned string without trailing formatting chars
-            return text.rstrip("*`")
-        except Exception as e:
+            return _chat_answer(CLEANING_MODEL, prompt, description="answer cleaning")
+        except Exception:
             # Fallback to standard normalization regex if API formatting call fails
             return _normalize_answer_for_submission(raw_answer)
 
@@ -1626,15 +1684,84 @@ class GAIASolverAgent:
             worklog["error"] = str(e)
             return f"Error: {e}", worklog
 
+# ─── Forced-answer synthesis helpers (Part B) ─────────────────────────
+# When a Task hits the soft deadline, its partial Worklog is snapshotted and a
+# best-effort Answer is synthesized from it (decisions B1-B4) so something real
+# is still submitted with status "forced".
+
+def _format_partial_trace(worklog: dict) -> str:
+    """Formats a (partial) Worklog into a compact readable trace for synthesis."""
+    lines = []
+    for step in worklog.get("steps", []):
+        thought = (step.get("thought") or "").strip()
+        if thought:
+            lines.append(f"Thought: {thought}")
+        for call in step.get("tool_calls") or []:
+            name = call.get("name", "unknown")
+            args = _coerce_tool_arguments(call.get("arguments", ""))
+            lines.append(f"Tool: {name}({json.dumps(args, ensure_ascii=False)})")
+        obs = (step.get("observations") or "").strip()
+        if obs:
+            lines.append(f"Observation: {obs[:2000]}")
+    return "\n".join(lines)
+
+
+def _synthesize_forced_answer(question: str, partial_trace: str) -> str:
+    """Synthesizes a best-effort final Answer from a partial reasoning trace.
+
+    Uses the cleaning-model path (DeepSeek, retried via ``_call_with_retry``)
+    with the forced-answer prompt. The caller bounds this call (via
+    ``_run_with_timeout``) so the total stays under the hard cap. Raises on
+    model failure — the worker then records the Task as ``timeout`` (decision
+    B2: a failed synthesis is NOT submitted).
+    """
+    prompt = _build_forced_answer_prompt(question, partial_trace)
+    text = _chat_answer(CLEANING_MODEL, prompt, description="forced answer")
+    if not text:
+        raise ValueError("Forced-answer synthesis returned an empty answer")
+    return _normalize_answer_for_submission(text)
+
+
+def _forced_answer_budget() -> float:
+    """Seconds available for forced-answer synthesis before the hard cap.
+
+    Clamped to ``FORCE_ANSWER_TIMEOUT_SEC`` and to the remaining hard-soft
+    budget; 0 (or negative) when the hard cap leaves no room, which means the
+    Task must be recorded as a plain timeout instead.
+    """
+    remaining = TASK_HARD_TIMEOUT_SEC - TASK_SOFT_TIMEOUT_SEC
+    return max(0.0, min(FORCE_ANSWER_TIMEOUT_SEC, remaining))
+
+
+def _snapshot_partial_worklog(agent) -> dict:
+    """Best-effort snapshot of an Agent's partial ReAct trace at the soft deadline.
+
+    The wedged ``solve`` daemon helper thread may still be mutating
+    ``agent.agent.memory.steps`` while this runs, so the read is deliberately
+    racy: it serializes whatever steps are visible and, if the in-flight
+    mutation makes serialization fail, falls back to an empty trace (the
+    synthesis then produces a best-effort Answer from the Question alone).
+    """
+    try:
+        memory = getattr(getattr(agent, "agent", None), "memory", None)
+        steps = memory.steps if memory is not None else []
+        return _serialize_worklog(steps, status="forced")
+    except Exception:
+        worklog = _serialize_worklog([], status="forced")
+        worklog["error"] = "Partial Worklog unavailable at the soft deadline"
+        return worklog
+
+
 # ─── Asynchronous Threaded Console Script Execution ──────────────────────
 def _make_result(idx, task, answer, elapsed, *, worklog=None, source="live",
                  status="completed", timestamp=None):
     """Builds a structured result record for a Task.
 
     ``source`` is "live" (solved by the Agent this Run) or "bundle" (submitted
-    from the committed Answer bundle). ``status`` is "completed", "error", or
-    "timeout". The record stays consistent with the Answer bundle entry for the
-    same Task (same task_id / answer / worklog / timestamp).
+    from the committed Answer bundle). ``status`` is "completed", "forced"
+    (Answer synthesized from a partial trace at the soft deadline), "error",
+    or "timeout". The record stays consistent with the Answer bundle entry for
+    the same Task (same task_id / answer / worklog / timestamp).
     """
     return {
         "index": idx + 1,
@@ -1667,6 +1794,85 @@ def _make_bundled_result(idx, task, entry):
     result["file_name"] = entry.get("file_name", result["file_name"])
     result["question"] = entry.get("question", result["question"])
     return result
+
+
+def _timeout_result(idx, task, t0) -> dict:
+    """Builds the hard-cap timeout result record (not submitted, decision B2/B3)."""
+    return _make_result(
+        idx, task,
+        f"Error: Task timed out after {TASK_HARD_TIMEOUT_SEC:.0f}s",
+        time.time() - t0, worklog=None, source="live", status="timeout",
+    )
+
+
+def _run_task(agent, idx, task) -> tuple[dict, bool]:
+    """Solves one Task under the two-stage soft/hard timeout.
+
+    Returns ``(result, replace_agent)`` where ``result`` is the structured
+    result record (status ``completed``, ``forced``, ``timeout``, or ``error``)
+    and ``replace_agent`` is True only when the Agent's ``solve`` was
+    interrupted at the soft deadline — its daemon helper thread may still be
+    wedged, so it must not be reused (the caller swaps in a fresh Agent).
+
+    The two-stage budget (decisions B1-B4):
+    - Within ``TASK_SOFT_TIMEOUT_SEC`` the normal result is used.
+    - Otherwise the partial Worklog is snapshotted (best-effort — the wedged
+      thread may still be mutating ``agent.memory.steps``) and a best-effort
+      Answer is synthesized from it, bounded by ``_forced_answer_budget()`` so
+      the total stays under the hard cap. Synthesis success → status ``forced``
+      (submitted); failure or hard cap → status ``timeout`` (not submitted).
+    """
+    t0 = time.time()
+    try:
+        answer, worklog = _run_with_timeout(
+            lambda: agent.solve(
+                task.get("task_id", "???"),
+                task.get("question", ""),
+                task.get("file_name", ""),
+            ),
+            TASK_SOFT_TIMEOUT_SEC,
+        )
+        return (
+            _make_result(idx, task, answer, time.time() - t0,
+                         worklog=worklog, source="live",
+                         status=worklog.get("status", "completed")),
+            False,
+        )
+    except TimeoutError:
+        # Soft deadline reached. The wedged Agent must always be discarded
+        # (replace_agent=True), whether the synthesis succeeds (forced) or not
+        # (timeout).
+        budget = _forced_answer_budget()
+        if budget <= 0:
+            # No room left before the hard cap: record a plain timeout.
+            return _timeout_result(idx, task, t0), True
+        try:
+            partial_worklog = _snapshot_partial_worklog(agent)
+            answer = _run_with_timeout(
+                lambda: _synthesize_forced_answer(
+                    task.get("question", ""),
+                    _format_partial_trace(partial_worklog),
+                ),
+                budget,
+            )
+            return (
+                _make_result(idx, task, answer, time.time() - t0,
+                             worklog=partial_worklog, source="live",
+                             status="forced"),
+                True,
+            )
+        except Exception:
+            # Forced-answer synthesis failed or hit the hard cap: record a
+            # plain timeout (not submitted, per decision B2/B3).
+            return _timeout_result(idx, task, t0), True
+    except Exception as e:
+        # A throwing Task must not lose the worker: record an error Answer so
+        # the Run still completes for every Task. The Agent is still reusable.
+        return (
+            _make_result(idx, task, f"Error: {e}", time.time() - t0,
+                         worklog=None, source="live", status="error"),
+            False,
+        )
 
 
 def run_pipeline_and_save_csv(force: bool = False):
@@ -1758,37 +1964,20 @@ def run_pipeline_and_save_csv(force: bool = False):
                 t0 = time.time()
                 replaced = False
                 try:
-                    # Run the Agent on the Task, bounded by TASK_TIMEOUT_SEC so
-                    # a stuck call cannot block this worker (or the whole Run)
-                    answer, worklog = _run_with_timeout(
-                        lambda: my_agent.solve(
-                            task.get("task_id", "???"),
-                            task.get("question", ""),
-                            task.get("file_name", ""),
-                        ),
-                        TASK_TIMEOUT_SEC,
-                    )
-                    return _make_result(
-                        idx, task, answer, time.time() - t0,
-                        worklog=worklog, source="live",
-                        status=worklog.get("status", "completed"),
-                    )
-                except TimeoutError:
-                    # The Agent may still be wedged in a hung call on a daemon
-                    # helper thread. Never reuse a possibly-corrupted Agent:
-                    # drop it and put a fresh one in its place so the pool
-                    # stays at full strength
-                    replaced = True
-                    try:
-                        agent_queue.put(GAIASolverAgent())
-                    except Exception as e:
-                        print(f"⚠️ Could not replace a timed-out Agent: {e}")
-                    return _make_result(
-                        idx, task,
-                        f"Error: Task timed out after {TASK_TIMEOUT_SEC:.0f}s",
-                        time.time() - t0, worklog=None, source="live",
-                        status="timeout",
-                    )
+                    # Delegate the two-stage soft/hard timeout (and forced-answer
+                    # synthesis at the soft deadline) to _run_task
+                    result, must_replace = _run_task(my_agent, idx, task)
+                    replaced = must_replace
+                    if must_replace:
+                        # The Agent may still be wedged in a hung call on a
+                        # daemon helper thread. Never reuse a possibly-corrupted
+                        # Agent: drop it and put a fresh one in its place so the
+                        # pool stays at full strength
+                        try:
+                            agent_queue.put(GAIASolverAgent())
+                        except Exception as e:
+                            print(f"⚠️ Could not replace a timed-out Agent: {e}")
+                    return result
                 except Exception as e:
                     # A throwing Task must not lose the worker: record an error
                     # Answer for this Task so the Run still completes for every
@@ -1815,7 +2004,7 @@ def run_pipeline_and_save_csv(force: bool = False):
             completed = 0
             try:
                 # Consume results in submission order. Each worker enforces its
-                # own TASK_TIMEOUT_SEC internally, so every future resolves in
+                # own soft/hard timeout internally, so every future resolves in
                 # bounded time
                 for future, (i, task) in futures.items():
                     try:
@@ -1829,9 +2018,11 @@ def run_pipeline_and_save_csv(force: bool = False):
                     completed_results.append(res)  # Store result record
 
                     # Fold a successfully solved Task into the Answer bundle so
-                    # the next Run submits it without re-solving. Failed Tasks
-                    # (error/timeout) stay out and are retried next Run.
-                    if res["status"] == "completed":
+                    # the next Run submits it without re-solving. Completed and
+                    # forced Tasks (a synthesized soft-deadline Answer that IS
+                    # submitted — decision B3) are folded; error/timeout Tasks
+                    # stay out and are retried next Run.
+                    if res["status"] in ("completed", "forced"):
                         bundle[res["task_id"]] = _make_bundle_entry(
                             task_id=res["task_id"],
                             question=res["question"],
@@ -1848,8 +2039,9 @@ def run_pipeline_and_save_csv(force: bool = False):
                           f"{res['execution_time_sec']}s | Answer: {res['answer']}")
             finally:
                 # Worker threads finish their current Task within
-                # TASK_TIMEOUT_SEC, so shutdown(wait=True) completes promptly;
-                # wedged daemon helper threads cannot block the process at exit
+                # TASK_SOFT_TIMEOUT_SEC + FORCE_ANSWER_TIMEOUT_SEC, so
+                # shutdown(wait=True) completes promptly; wedged daemon helper
+                # threads cannot block the process at exit
                 executor.shutdown(wait=True, cancel_futures=True)
 
     # Re-sort results list by original dataset question index ordering
@@ -1859,11 +2051,14 @@ def run_pipeline_and_save_csv(force: bool = False):
     # (1) a force re-solve that now FAILS a previously-bundled Task must not
     # leave a stale entry behind (the next non-forced Run would resubmit the
     # old Answer while this Run's CSV shows an error) — drop it so it is
-    # retried; (2) Tasks the server no longer serves are pruned so the bundle
-    # stays consistent with the results CSV and never outgrows the served set.
+    # retried. A forced (soft-deadline) result is kept, not dropped: it was
+    # already folded above and IS submitted and scored (decision B3), so it
+    # must not be treated like an error/timeout; (2) Tasks the server no
+    # longer serves are pruned so the bundle stays consistent with the results
+    # CSV and never outgrows the served set.
     if force:
         for res in completed_results:
-            if res["source"] == "live" and res["status"] != "completed":
+            if res["source"] == "live" and res["status"] not in ("completed", "forced"):
                 bundle.pop(res["task_id"], None)
     served_ids = {t.get("task_id") for t in questions_data if t.get("task_id")}
     for task_id in list(bundle):

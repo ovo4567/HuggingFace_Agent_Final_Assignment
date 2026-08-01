@@ -69,7 +69,9 @@ Answers** click.
 | `DEEPSEEK_CLEANING_MODEL` | — | `deepseek-chat` | Model for the final-answer cleaning pass. |
 | `GAIA_NUM_WORKERS` | — | `4` | Parallel Agent workers in a local Run. |
 | `CLEANING_MAX_TOKENS` | — | `1024` | Max tokens for the cleaning pass (raised so long list Answers aren't truncated). |
-| `GAIA_TASK_TIMEOUT` | — | `600` | Per-Task safety timeout (seconds). |
+| `GAIA_TASK_SOFT_TIMEOUT` | — | `300` | Soft per-Task deadline: at this point the Agent is stopped and a best-effort Answer is synthesized from its partial Worklog (status `forced`, submitted). |
+| `GAIA_TASK_HARD_TIMEOUT` | — | `360` | Hard per-Task deadline: at this point the Task is terminated and recorded as `timeout` (not submitted). Must be ≥ soft. |
+| `GAIA_FORCE_ANSWER_TIMEOUT` | — | `45` | Bounds the forced-answer synthesis call so soft + synthesis stays under the hard cap. |
 | `GAIA_RESULTS_CSV` | — | `gaia_results.csv` | Local Run results CSV path. |
 | `ANSWER_BUNDLE_PATH` | — | `<repo>/answer_bundle.json` | Answer bundle path (committed artifact). |
 | `VISION_MODEL_ID` | — | `Qwen/Qwen2-VL-2B-Instruct` | Local vision model (local-only per ADR-0002). |

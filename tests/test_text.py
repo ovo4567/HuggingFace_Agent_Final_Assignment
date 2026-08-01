@@ -250,6 +250,211 @@ class TestRunWithTimeout:
             text._run_with_timeout(boom, timeout=5.0)
 
 
+# ─── Forced-answer synthesis prompt (Part B) ───────────────────────────
+class TestBuildForcedAnswerPrompt:
+    def test_interpolates_question_and_trace(self):
+        prompt = text._build_forced_answer_prompt("Q?", "Trace: step 1")
+        assert "Q?" in prompt
+        assert "Trace: step 1" in prompt
+
+    def test_braces_in_trace_do_not_crash(self):
+        # A partial trace may contain code/JSON with braces; replacement-based
+        # interpolation must not raise or corrupt the sentinels.
+        prompt = text._build_forced_answer_prompt("Q?", '{"code": {1, 2}}')
+        assert '{"code": {1, 2}}' in prompt
+
+    def test_none_values_become_empty(self):
+        prompt = text._build_forced_answer_prompt(None, None)
+        assert "PARTIAL REASONING TRACE" in prompt
+
+
+class TestFormatPartialTrace:
+    def test_formats_thought_tool_and_observation(self):
+        worklog = text._serialize_worklog([
+            _FakeActionStep(
+                step_number=1,
+                thought="read the pdf",
+                tool_calls=[_FakeToolCall("inspect_pdf", {"path": "a.pdf"})],
+                observations="page 1 contents",
+            ),
+        ], status="forced")
+        trace = text._format_partial_trace(worklog)
+        assert "Thought: read the pdf" in trace
+        assert "Tool: inspect_pdf" in trace
+        assert "Observation: page 1 contents" in trace
+
+    def test_empty_worklog_returns_empty(self):
+        worklog = text._serialize_worklog([], status="forced")
+        assert text._format_partial_trace(worklog) == ""
+
+
+# ─── Forced-answer budget (Part B) ─────────────────────────────────────
+class TestForcedAnswerBudget:
+    def test_default_uses_force_timeout(self, monkeypatch):
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 300)
+        monkeypatch.setattr(text, "TASK_HARD_TIMEOUT_SEC", 360)
+        monkeypatch.setattr(text, "FORCE_ANSWER_TIMEOUT_SEC", 45)
+        assert text._forced_answer_budget() == 45.0
+
+    def test_clamped_to_remaining_budget(self, monkeypatch):
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 300)
+        monkeypatch.setattr(text, "TASK_HARD_TIMEOUT_SEC", 310)
+        monkeypatch.setattr(text, "FORCE_ANSWER_TIMEOUT_SEC", 45)
+        assert text._forced_answer_budget() == 10.0
+
+    def test_zero_when_soft_equals_hard(self, monkeypatch):
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 300)
+        monkeypatch.setattr(text, "TASK_HARD_TIMEOUT_SEC", 300)
+        monkeypatch.setattr(text, "FORCE_ANSWER_TIMEOUT_SEC", 45)
+        assert text._forced_answer_budget() == 0.0
+
+    def test_zero_when_hard_below_soft(self, monkeypatch):
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 360)
+        monkeypatch.setattr(text, "TASK_HARD_TIMEOUT_SEC", 300)
+        monkeypatch.setattr(text, "FORCE_ANSWER_TIMEOUT_SEC", 45)
+        assert text._forced_answer_budget() == 0.0
+
+
+# ─── Partial Worklog snapshot (Part B) ─────────────────────────────────
+class TestSnapshotPartialWorklog:
+    def test_snapshots_agent_steps(self):
+        steps = [_FakeActionStep(step_number=1, thought="partial", duration=1.0)]
+        agent = SimpleNamespace(agent=SimpleNamespace(
+            memory=SimpleNamespace(steps=steps)))
+        worklog = text._snapshot_partial_worklog(agent)
+        assert worklog["status"] == "forced"
+        assert len(worklog["steps"]) == 1
+        assert worklog["steps"][0]["thought"] == "partial"
+
+    def test_falls_back_to_empty_on_serialization_failure(self):
+        class _BadMemory:
+            @property
+            def steps(self):
+                raise RuntimeError("mid-mutation")
+        agent = SimpleNamespace(agent=SimpleNamespace(memory=_BadMemory()))
+        worklog = text._snapshot_partial_worklog(agent)
+        assert worklog["status"] == "forced"
+        assert worklog["steps"] == []
+        assert "error" in worklog
+
+
+# ─── Two-stage soft/hard timeout worker (Part B) ───────────────────────
+class _FastSolver:
+    """solve() returns promptly with a completed Worklog."""
+
+    def __init__(self):
+        self.agent = SimpleNamespace(memory=SimpleNamespace(steps=[]))
+
+    def solve(self, task_id, question, file_name, file_path=None):
+        return "42", {"status": "completed", "steps": []}
+
+
+class _BoomSolver:
+    """solve() raises — a throwing Task must not lose the worker."""
+
+    def __init__(self):
+        self.agent = SimpleNamespace(memory=SimpleNamespace(steps=[]))
+
+    def solve(self, task_id, question, file_name, file_path=None):
+        raise RuntimeError("boom")
+
+
+class _SlowSolver:
+    """solve() sleeps past the soft deadline, wedging like a hung call."""
+
+    def __init__(self):
+        self.agent = SimpleNamespace(memory=SimpleNamespace(steps=[]))
+
+    def solve(self, task_id, question, file_name, file_path=None):
+        import time
+        time.sleep(5)
+        return "late", {"status": "completed", "steps": []}
+
+
+class TestRunTaskTimeout:
+    def _task(self):
+        return {"task_id": "t1", "question": "Q?", "file_name": ""}
+
+    def test_completes_normally_within_soft_timeout(self, monkeypatch):
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 5.0)
+        result, replace = text._run_task(_FastSolver(), 0, self._task())
+        assert result["status"] == "completed"
+        assert result["answer"] == "42"
+        assert replace is False
+
+    def test_solve_error_is_recorded_and_agent_reused(self, monkeypatch):
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 5.0)
+        result, replace = text._run_task(_BoomSolver(), 0, self._task())
+        assert result["status"] == "error"
+        assert result["answer"].startswith("Error:")
+        assert replace is False
+
+    def test_soft_deadline_synthesizes_forced_answer(self, monkeypatch):
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(text, "TASK_HARD_TIMEOUT_SEC", 10.0)
+        monkeypatch.setattr(text, "FORCE_ANSWER_TIMEOUT_SEC", 1.0)
+        calls = {}
+
+        def fake_synth(question, trace):
+            calls["question"] = question
+            calls["trace"] = trace
+            return "forced-42"
+
+        monkeypatch.setattr(text, "_synthesize_forced_answer", fake_synth)
+        result, replace = text._run_task(_SlowSolver(), 0, self._task())
+        assert result["status"] == "forced"
+        assert result["answer"] == "forced-42"
+        assert replace is True  # wedged Agent must be discarded
+        assert calls["question"] == "Q?"
+        assert calls["trace"] == ""  # empty partial trace
+
+    def test_synthesis_failure_records_timeout(self, monkeypatch):
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(text, "TASK_HARD_TIMEOUT_SEC", 10.0)
+        monkeypatch.setattr(text, "FORCE_ANSWER_TIMEOUT_SEC", 1.0)
+
+        def fake_synth(question, trace):
+            raise RuntimeError("synthesis failed")
+
+        monkeypatch.setattr(text, "_synthesize_forced_answer", fake_synth)
+        result, replace = text._run_task(_SlowSolver(), 0, self._task())
+        assert result["status"] == "timeout"
+        assert "timed out" in result["answer"]
+        assert replace is True
+
+    def test_hard_cap_enforced_when_no_budget(self, monkeypatch):
+        # soft == hard → zero synthesis budget → no synthesis call, plain timeout
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(text, "TASK_HARD_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(text, "FORCE_ANSWER_TIMEOUT_SEC", 45.0)
+        called = []
+        monkeypatch.setattr(text, "_synthesize_forced_answer",
+                            lambda q, t: called.append(q) or "x")
+        result, replace = text._run_task(_SlowSolver(), 0, self._task())
+        assert result["status"] == "timeout"
+        assert called == []  # synthesis never attempted
+        assert replace is True
+
+    def test_synthesis_overrun_records_timeout(self, monkeypatch):
+        # The synthesis call itself is bounded by _forced_answer_budget(); if it
+        # overruns (a hung model call), the hard cap fires and a plain timeout
+        # is recorded (decision B2).
+        monkeypatch.setattr(text, "TASK_SOFT_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(text, "TASK_HARD_TIMEOUT_SEC", 1.0)
+        monkeypatch.setattr(text, "FORCE_ANSWER_TIMEOUT_SEC", 0.1)
+
+        def slow_synth(question, trace):
+            import time
+            time.sleep(5)
+            return "late"
+
+        monkeypatch.setattr(text, "_synthesize_forced_answer", slow_synth)
+        result, replace = text._run_task(_SlowSolver(), 0, self._task())
+        assert result["status"] == "timeout"
+        assert "timed out" in result["answer"]
+        assert replace is True
+
+
 # ─── Retrying model (ticket 01) ───────────────────────────────────────
 class TestRetryingOpenAIServerModel:
     def test_generate_reaches_base_generate(self, monkeypatch):
@@ -858,6 +1063,32 @@ class TestRunPipelineBundling:
 
         bundle = text._load_answer_bundle(str(tmp_path / "bundle.json"))
         assert set(bundle) == {"t1"}
+
+    def test_forced_answer_is_folded_into_bundle(self, monkeypatch, tmp_path):
+        # A soft-deadline Task that yields a synthesized Answer (status "forced")
+        # is submitted and scored (decision B3), so it must be folded into the
+        # bundle like a completed Task.
+        class _ForcedSolverAgent(_FakeSolverAgent):
+            calls = []
+
+            def solve(self, task_id, question, file_name):
+                _ForcedSolverAgent.calls.append(task_id)
+                worklog = {
+                    "steps": [], "tool_summary": [],
+                    "total_duration_sec": 0.0, "status": "forced",
+                }
+                return f"forced-{task_id}", worklog
+
+        _ForcedSolverAgent.calls = []
+        self._patch(monkeypatch, tmp_path, _ForcedSolverAgent)
+        text.run_pipeline_and_save_csv(force=False)
+
+        bundle = text._load_answer_bundle(str(tmp_path / "bundle.json"))
+        assert set(bundle) == {"t1", "t2"}
+        assert bundle["t1"]["answer"] == "forced-t1"
+        assert bundle["t1"]["worklog"]["status"] == "forced"
+        df = pd.read_csv(tmp_path / "results.csv")
+        assert set(df["status"]) == {"forced"}
 
 
 # ─── solve() Worklog capture on failure (ticket 03) ─────────────────────
