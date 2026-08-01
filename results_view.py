@@ -35,22 +35,35 @@ _TOOL_ARGS_DISPLAY_LIMIT = 400
 
 # Scoped CSS (all classes prefixed ``gv-``) so it cannot clash with Gradio's
 # own stylesheet inside the iframe.
+#
+# Dark-mode hardening: Gradio auto-dark-modes the page (it follows the OS
+# ``prefers-color-scheme`` and tags ``body.dark``), and its theme CSS then
+# overrides this fragment's text ``color`` with higher specificity — producing
+# light-on-light text. So:
+#   * ``color`` and ``color-scheme`` are declared ``!important``, which beats
+#     any normal (non-important) theme rule regardless of specificity;
+#   * ``.gv-root *`` force-sets dark text on *every* descendant, because the
+#     theme sets ``color`` directly on nested elements and breaks inheritance;
+#   * the later secondary-colour rules re-assert the muted/white/gray tones
+#     (equal-or-higher specificity + ``!important``, later in the sheet, so
+#     they win over the ``.gv-root *`` base).
 _CSS = """
-.gv-root{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2328;line-height:1.5}
-.gv-badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11px;font-weight:600;color:#fff;white-space:nowrap}
+.gv-root{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2328 !important;color-scheme:light !important;line-height:1.5}
+.gv-root *{color:#1f2328 !important}
+.gv-badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:11px;font-weight:600;color:#fff !important;white-space:nowrap}
 .gv-badge.gv-level1{background:#10b981}.gv-badge.gv-level2{background:#f59e0b}.gv-badge.gv-level3{background:#ef4444}
 .gv-badge.gv-source-bundle{background:#4f46e5}.gv-badge.gv-source-live{background:#0e7490}
 .gv-badge.gv-status-completed{background:#6b7280}.gv-badge.gv-status-error{background:#b91c1c}.gv-badge.gv-status-timeout{background:#b45309}.gv-badge.gv-status-forced{background:#7c3aed}
-.gv-muted{color:#6b7280}.gv-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+.gv-muted{color:#6b7280 !important}.gv-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
 .gv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:10px}
 .gv-stat{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:12px 14px}
-.gv-stat .gv-k{font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.04em}
+.gv-stat .gv-k{font-size:11px;color:#6b7280 !important;text-transform:uppercase;letter-spacing:.04em}
 .gv-stat .gv-v{font-size:22px;font-weight:700;margin-top:2px}
 .gv-message{background:#fef9c3;border:1px solid #fde047;border-radius:10px;padding:10px 14px;margin-bottom:14px}
 .gv-table-wrap{overflow-x:auto;background:#fff;border:1px solid #e5e7eb;border-radius:10px}
 table.gv-table{width:100%;border-collapse:collapse;min-width:720px}
 table.gv-table th,table.gv-table td{border-bottom:1px solid #e5e7eb;padding:10px;text-align:left;vertical-align:top}
-table.gv-table th{background:#f1f2f4;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280}
+table.gv-table th{background:#f1f2f4;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#6b7280 !important}
 table.gv-table tr:last-child td{border-bottom:none}
 details.gv-worklog{margin-top:6px;border:1px solid #e5e7eb;border-radius:8px;background:#fafafa}
 details.gv-worklog summary{cursor:pointer;padding:8px 10px;font-weight:600;user-select:none}
@@ -60,7 +73,7 @@ table.gv-wl-summary{width:100%;border-collapse:collapse;font-size:12px;margin-bo
 table.gv-wl-summary th,table.gv-wl-summary td{border:1px solid #e5e7eb;padding:4px 8px;text-align:left}
 .gv-step{border-left:3px solid #4f46e5;padding:6px 8px;margin:6px 0;background:#fff;border-radius:0 6px 6px 0}
 .gv-step .gv-step-head{font-weight:700;font-size:12px}
-.gv-step .gv-thought{font-style:italic;color:#374151;margin:4px 0;white-space:pre-wrap;word-break:break-word}
+.gv-step .gv-thought{font-style:italic;color:#374151 !important;margin:4px 0;white-space:pre-wrap;word-break:break-word}
 .gv-step .gv-obs{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:6px;padding:6px 8px;margin:4px 0;font-size:12px;white-space:pre-wrap;word-break:break-word}
 .gv-step .gv-toolcall{background:#eef2ff;border:1px solid #c7d2fe;border-radius:6px;padding:6px 8px;margin:4px 0;font-size:12px;word-break:break-word}
 .gv-trace{max-height:""" + _TRACE_MAX_HEIGHT + """;overflow:auto}
