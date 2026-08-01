@@ -1,9 +1,17 @@
-# Secrets — never commit API keys
+# Secrets — never commit API keys (but do commit the .env.example template)
 .env
 .env.*
+!.env.example
 
 # Pre-downloaded benchmark Attachments (large; fetched by the server / local Run)
 files/
+
+# Agent-internal tooling & notes (skills, issue tracker, session handoffs) —
+# kept out of the shared repo so it stays small and safe to share
+.agents/
+.scratch/
+skills-lock.json
+SESSION_HANDOFF.md
 
 # Python
 __pycache__/
@@ -16,6 +24,7 @@ __pycache__/
 # Local Run outputs (regenerated each Run; the Answer bundle is committed instead)
 gaia_results.csv
 
-# OS / editor
+# OS / editor / logs
 .DS_Store
 .vscode/
+*.log
