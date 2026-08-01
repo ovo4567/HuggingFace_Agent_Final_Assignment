@@ -12,3 +12,13 @@ local model fails *and* a hosted key is configured. This exception is required
 by the ticket's acceptance criteria and is documented in the
 `transcribe_audio` docstring. Vision remains strictly local-only (Qwen2-VL);
 the live-on-Space fallback is still text/web-only.
+
+## Update (2026-08-01, Part A device auto-selection)
+
+The local models now auto-select their compute device via the `LOCAL_DEVICE`
+setting (`auto` probes Apple MPS → CUDA → CPU, else CPU). faster-whisper always
+runs on CPU on Apple Silicon because CTranslate2 — its inference backend — has
+no MPS support; the resolver clamps `mps → cpu` for whisper
+(`compute_type="int8"` on CPU, `"float16"` on CUDA). Qwen2-VL uses MPS/CUDA when
+available (`float16`) and CPU otherwise (`float32`). Vision remains local-only.
+
