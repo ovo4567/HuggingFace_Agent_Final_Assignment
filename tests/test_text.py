@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import zipfile
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -371,6 +372,113 @@ class TestTranscribeAudioRouting:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
         assert text.transcribe_audio("file.mp3") == "Error: local failed"
+
+
+# ─── Local device resolution (Part A: device auto-selection) ──────────
+class TestIsAccelerator:
+    def test_mps_is_accelerator(self):
+        assert text._is_accelerator("mps") is True
+
+    def test_cuda_is_accelerator(self):
+        assert text._is_accelerator("cuda") is True
+
+    def test_cpu_is_not_accelerator(self):
+        assert text._is_accelerator("cpu") is False
+
+
+class TestResolveLocalDevice:
+    """The LOCAL_DEVICE resolver: explicit override vs auto probe (mps→cuda→cpu)."""
+
+    def _fake_torch(self, mps=False, cuda=False):
+        return SimpleNamespace(
+            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: mps)),
+            cuda=SimpleNamespace(is_available=lambda: cuda),
+        )
+
+    def test_explicit_cpu_is_honored(self, monkeypatch):
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "cpu")
+        assert text._resolve_local_device() == "cpu"
+
+    def test_explicit_mps_is_honored(self, monkeypatch):
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "mps")
+        assert text._resolve_local_device() == "mps"
+
+    def test_explicit_cuda_is_honored(self, monkeypatch):
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "cuda")
+        assert text._resolve_local_device() == "cuda"
+
+    def test_explicit_device_does_not_probe_torch(self, monkeypatch):
+        # An explicit value must short-circuit before importing/probing torch
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "cuda")
+        def boom():
+            raise AssertionError("should not probe torch")
+        monkeypatch.setattr(text, "_import_torch", boom)
+        assert text._resolve_local_device() == "cuda"
+
+    def test_auto_prefers_mps_when_available(self, monkeypatch):
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "auto")
+        monkeypatch.setattr(text, "_import_torch", lambda: self._fake_torch(mps=True, cuda=True))
+        assert text._resolve_local_device() == "mps"
+
+    def test_auto_falls_back_to_cuda_when_no_mps(self, monkeypatch):
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "auto")
+        monkeypatch.setattr(text, "_import_torch", lambda: self._fake_torch(mps=False, cuda=True))
+        assert text._resolve_local_device() == "cuda"
+
+    def test_auto_falls_back_to_cpu_when_no_accelerator(self, monkeypatch):
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "auto")
+        monkeypatch.setattr(text, "_import_torch", lambda: self._fake_torch(mps=False, cuda=False))
+        assert text._resolve_local_device() == "cpu"
+
+    def test_auto_returns_cpu_when_torch_unavailable(self, monkeypatch):
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "auto")
+        def boom():
+            raise ImportError("no torch")
+        monkeypatch.setattr(text, "_import_torch", boom)
+        assert text._resolve_local_device() == "cpu"
+
+    def test_unknown_value_treated_as_auto(self, monkeypatch):
+        monkeypatch.setattr(text, "LOCAL_DEVICE", "banana")
+        monkeypatch.setattr(text, "_import_torch", lambda: self._fake_torch(mps=False, cuda=True))
+        assert text._resolve_local_device() == "cuda"
+
+
+# ─── Whisper device clamping (Part A) ─────────────────────────────────
+class TestWhisperDeviceConfig:
+    """faster-whisper accepts only cpu/cuda (CTranslate2 has no MPS backend)."""
+
+    def test_mps_is_clamped_to_cpu_int8(self):
+        assert text._whisper_device_config("mps") == ("cpu", "int8")
+
+    def test_cuda_uses_float16(self):
+        assert text._whisper_device_config("cuda") == ("cuda", "float16")
+
+    def test_cpu_uses_int8(self):
+        assert text._whisper_device_config("cpu") == ("cpu", "int8")
+
+
+# ─── Qwen vision load config (Part A) ─────────────────────────────────
+class TestVisionLoadConfig:
+    """Qwen dtype: float16 on accelerators (mps/cuda), float32 on cpu.
+    device_map='auto' is used only for cuda (no transformers mps device_map)."""
+
+    def _fake_torch(self):
+        return SimpleNamespace(float16="fp16", float32="fp32")
+
+    def test_mps_uses_float16_and_no_device_map(self):
+        dtype, device_map = text._vision_load_config(self._fake_torch(), "mps")
+        assert dtype == "fp16"
+        assert device_map is None
+
+    def test_cuda_uses_float16_and_auto_device_map(self):
+        dtype, device_map = text._vision_load_config(self._fake_torch(), "cuda")
+        assert dtype == "fp16"
+        assert device_map == "auto"
+
+    def test_cpu_uses_float32_and_no_device_map(self):
+        dtype, device_map = text._vision_load_config(self._fake_torch(), "cpu")
+        assert dtype == "fp32"
+        assert device_map is None
 
 
 # ─── Frame-count resolution (ticket 02) ───────────────────────────────

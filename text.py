@@ -83,6 +83,13 @@ TASK_TIMEOUT_SEC = float(os.getenv("GAIA_TASK_TIMEOUT", "600"))
 VISION_MODEL_ID = os.getenv("VISION_MODEL_ID", "Qwen/Qwen2-VL-2B-Instruct")
 
 # ─── Multimodal config (ADR-0002: local-only) ─────────────────────────
+# Local compute device for the multimodal models (Qwen vision + faster-whisper).
+# One of: auto | cpu | mps | cuda (default 'auto'). 'auto' probes torch for an
+# accelerator — Apple MPS first, then CUDA — and falls back to 'cpu'. Note:
+# faster-whisper clamps mps->cpu because CTranslate2 has no MPS backend (see
+# _whisper_device_config).
+LOCAL_DEVICE = os.getenv("LOCAL_DEVICE", "auto").strip().lower()
+
 # Local audio model used by the 'transcribe_audio' tool (faster-whisper).
 # Lightweight by default; use a larger model (e.g. 'small'/'medium') for
 # better accuracy at the cost of speed and memory.
@@ -642,6 +649,71 @@ def _save_answer_bundle(bundle: dict, path: str | None = None) -> str:
     os.replace(tmp_path, path)
     return path
 
+# ─── Local device resolution (Part A: device auto-selection) ──────────
+# A tiny lazy-import seam so the device resolver is unit-testable without
+# torch installed (tests inject a fake module).
+def _import_torch():
+    """Lazily imports and returns the ``torch`` module (or raises ImportError)."""
+    import torch
+    return torch
+
+
+_VALID_LOCAL_DEVICES = ("cpu", "mps", "cuda")
+
+
+def _is_accelerator(local_device: str) -> bool:
+    """True if ``local_device`` is a torch accelerator (mps or cuda)."""
+    return local_device in ("mps", "cuda")
+
+
+def _resolve_local_device() -> str:
+    """Resolves the local compute device for the multimodal models.
+
+    Reads the module-level ``LOCAL_DEVICE`` setting ('auto' | 'cpu' | 'mps' |
+    'cuda', default 'auto'):
+
+    - An explicit ``cpu``/``mps``/``cuda`` is returned as-is (no torch probe).
+    - ``auto`` (or any unrecognized value) probes torch for an accelerator,
+      preferring Apple MPS, then CUDA, and finally falls back to ``cpu``. If
+      torch is unavailable, ``cpu`` is returned.
+    """
+    if LOCAL_DEVICE in _VALID_LOCAL_DEVICES:
+        return LOCAL_DEVICE
+    try:
+        torch = _import_torch()
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _whisper_device_config(local_device: str):
+    """Maps a resolved local device to faster-whisper's ``(device, compute_type)``.
+
+    CTranslate2 (faster-whisper's backend) accepts only ``"cpu"`` or ``"cuda"``
+    — there is no MPS backend — so ``mps`` is clamped to ``cpu``. ``compute_type``
+    is ``"int8"`` on cpu (lightweight) and ``"float16"`` on cuda.
+    """
+    if local_device == "cuda":
+        return "cuda", "float16"
+    return "cpu", "int8"
+
+
+def _vision_load_config(torch, local_device: str):
+    """Returns ``(torch_dtype, device_map)`` for the Qwen vision model.
+
+    ``torch_dtype`` is ``float16`` on accelerators (mps/cuda) to halve memory
+    and ``float32`` on cpu. ``device_map='auto'`` is used only for cuda, because
+    transformers' device_map has no MPS backend.
+    """
+    dtype = torch.float16 if _is_accelerator(local_device) else torch.float32
+    device_map = "auto" if local_device == "cuda" else None
+    return dtype, device_map
+
+
 # ─── Agent Tools ──────────────────────────────────────────────────
 
 # Shared faster-whisper model singleton (loaded once, reused across workers)
@@ -666,8 +738,11 @@ def _transcribe_audio_local(audio_path: str) -> str:
         if _whisper_model is None:
             with _whisper_lock:
                 if _whisper_model is None:
-                    # CPU + int8 keeps the default ('tiny') lightweight per ADR-0002
-                    _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                    # Route through the shared local-device resolver. faster-whisper
+                    # has no MPS backend, so mps is clamped to cpu (int8); cuda uses
+                    # float16. See _whisper_device_config.
+                    device, compute_type = _whisper_device_config(_resolve_local_device())
+                    _whisper_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute_type)
 
         # Beam size 1 keeps latency low for the Agent loop
         segments, _info = _whisper_model.transcribe(audio_path, beam_size=1)
@@ -1045,7 +1120,7 @@ def inspect_image(image_path: str, question: str = "") -> str:
 
     try:
         # Import heavy libraries only when the tool is first invoked
-        import torch
+        torch = _import_torch()
         from transformers import AutoProcessor
 
         # Resolve the correct auto class (newer transformers name, with older fallback)
@@ -1054,22 +1129,26 @@ def inspect_image(image_path: str, question: str = "") -> str:
         except ImportError:
             from transformers import AutoModelForVision2Seq as _AutoVL
 
+        # Shared local-device resolver (LOCAL_DEVICE env: auto|cpu|mps|cuda)
+        device = _resolve_local_device()
+
         # ── Load the shared model + processor once (double-checked locking) ──
         if _vision_model is None:
             with _vision_lock:
                 if _vision_model is None:
-                    device = "cuda" if torch.cuda.is_available() else "cpu"
-                    dtype = torch.float16 if device == "cuda" else torch.float32
+                    dtype, device_map = _vision_load_config(torch, device)
 
                     _vision_processor = AutoProcessor.from_pretrained(VISION_MODEL_ID)
                     _vision_model = _AutoVL.from_pretrained(
                         VISION_MODEL_ID,
                         torch_dtype=dtype,
-                        device_map="auto" if device == "cuda" else None,
+                        device_map=device_map,
                     )
                     _vision_model.eval()
                     if device == "cpu":
                         _vision_model.to("cpu")
+                    elif device == "mps":
+                        _vision_model.to("mps")
 
         # ── Open the image and normalize to RGB ──
         image = Image.open(image_path).convert("RGB")
@@ -1111,10 +1190,10 @@ def inspect_image(image_path: str, question: str = "") -> str:
                     images=image, text=prompt_text, return_tensors="pt"
                 )
 
-            # Move inputs to GPU if available
-            if torch.cuda.is_available():
+            # Move inputs to the compute device (accelerators only)
+            if _is_accelerator(device):
                 inputs = {
-                    k: v.to("cuda") for k, v in inputs.items()
+                    k: v.to(device) for k, v in inputs.items()
                     if isinstance(v, torch.Tensor)
                 }
 

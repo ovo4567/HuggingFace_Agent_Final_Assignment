@@ -73,6 +73,7 @@ Answers** click.
 | `GAIA_RESULTS_CSV` | — | `gaia_results.csv` | Local Run results CSV path. |
 | `ANSWER_BUNDLE_PATH` | — | `<repo>/answer_bundle.json` | Answer bundle path (committed artifact). |
 | `VISION_MODEL_ID` | — | `Qwen/Qwen2-VL-2B-Instruct` | Local vision model (local-only per ADR-0002). |
+| `LOCAL_DEVICE` | — | `auto` | Local compute device for Qwen vision + faster-whisper: `auto` (probe MPS→CUDA→CPU) \| `cpu` \| `mps` \| `cuda`. Whisper clamps `mps→cpu` (CTranslate2 has no MPS). |
 | `WHISPER_MODEL` | — | `tiny` | Local faster-whisper model size. |
 | `USE_WHISPER_API` | — | off | Set `1`/`true` to prefer the hosted Whisper API over the local model. |
 | `OPENAI_API_KEY` | — | — | Hosted Whisper fallback (`whisper-1`). |
