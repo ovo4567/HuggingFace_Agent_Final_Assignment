@@ -249,6 +249,36 @@ class TestRunWithTimeout:
             text._run_with_timeout(boom, timeout=5.0)
 
 
+# ─── Retrying model (ticket 01) ───────────────────────────────────────
+class TestRetryingOpenAIServerModel:
+    def test_generate_reaches_base_generate(self, monkeypatch):
+        """Regression: generate() must actually reach the base implementation.
+
+        Zero-arg ``super()`` inside the retry lambda raises
+        ``RuntimeError: super(): no arguments`` — the ``__class__`` cell the
+        zero-arg form needs is created only for the method's own code object
+        and is NOT propagated into nested lambdas. The base ``generate`` is
+        stubbed so the real subclass path (generate -> _call_with_retry ->
+        super().generate) is exercised with no network.
+        """
+        sentinel = {"role": "assistant", "content": "stubbed"}
+
+        def fake_base_generate(self, messages, **kwargs):
+            return sentinel
+
+        # Patch the BASE class method only; the subclass's own generate still
+        # shadows it, so model.generate() drives the real retry path.
+        monkeypatch.setattr(text.OpenAIServerModel, "generate", fake_base_generate)
+
+        model = text._RetryingOpenAIServerModel(
+            model_id="test-model",
+            api_base="https://api.deepseek.com/v1",
+            api_key="sk-test",
+        )
+        result = model.generate([{"role": "user", "content": "hi"}])
+        assert result is sentinel
+
+
 # ─── Local-file resolution ────────────────────────────────────────────
 class TestGetLocalTaskFile:
     def test_exact_file_name_match(self, tmp_path, monkeypatch):

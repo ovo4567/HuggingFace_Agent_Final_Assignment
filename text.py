@@ -1312,8 +1312,12 @@ class _RetryingOpenAIServerModel(OpenAIServerModel):
     """
 
     def generate(self, messages, **kwargs):
+        # Zero-arg super() only works directly in a method body — it is NOT
+        # propagated into nested lambdas (no __class__ cell), so capture it
+        # here and let the retry lambda call the bound base method.
+        base = super()
         return _call_with_retry(
-            lambda: super().generate(messages, **kwargs),
+            lambda: base.generate(messages, **kwargs),
             description="model call",
         )
 
