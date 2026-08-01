@@ -1,5 +1,6 @@
 import os
 import gradio as gr
+import spaces
 
 import text
 import orchestration
@@ -9,6 +10,11 @@ import results_view
 DEFAULT_API_URL = os.getenv("GAIA_API_URL", "https://agents-course-unit4-scoring.hf.space")
 
 
+# ZeroGPU requires at least one @spaces.GPU-decorated function to detect at
+# startup (docs/adr/0002 keeps the Space text/web-only, so the GPU is not used
+# for inference here — the decorator just satisfies the ZeroGPU runtime, and is
+# a no-op when running locally or on CPU hardware).
+@spaces.GPU
 def run_and_submit_all(profile: gr.OAuthProfile | None):
     """
     Fetches the served Questions, submits the committed Answer bundle for every
