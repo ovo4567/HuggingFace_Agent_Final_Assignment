@@ -25,16 +25,31 @@ The full env-var table lives in [`README.md`](../README.md). The only
 
 Set them in the Space: **Settings → Variables and secrets → New variable**.
 
-## Push flow (both remotes)
+## GitHub mirror (one-time setup)
 
-```bash
-# Push the same main to the HF Space (primary)
-git push origin main
+The GitHub mirror does not exist yet — create it before you can push:
 
-# Push to the GitHub mirror
-git remote add github https://github.com/<owner>/<repo>.git   # one-time
-git push github main
-```
+1. Create an **empty** repository on GitHub (e.g.
+   `https://github.com/ovo456/Final_Assignment_Template`). Do **not**
+   initialize it with a README/license — that would create a conflicting root
+   commit and force a merge.
+2. Add it as a mirror remote:
+
+   ```bash
+   git remote add github https://github.com/<owner>/<repo>.git
+   ```
+
+3. Push the same `main` to both remotes:
+
+   ```bash
+   git push origin main    # HF Space (primary)
+   git push github main    # GitHub mirror
+   ```
+
+> Pushing to GitHub requires auth: an SSH key registered with your GitHub
+> account, or a PAT saved in your credential helper (`osxkeychain` on macOS).
+> If `git push github main` prompts for credentials, run `gh auth login`, or
+> add your public key at https://github.com/settings/keys.
 
 ## Dev loop (regenerate the Answer bundle)
 
